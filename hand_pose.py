@@ -3,6 +3,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe import solutions
 import cv2
+import sys
 
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
@@ -119,7 +120,9 @@ def get_landmarks(im_path, min_detection_confidence=.12, show_marks=False):
 if __name__ == "__main__":
 
   # example get_landmarks call:
-  dir = "./data/train/A/"
-  img = "image_1426.jpg"
+  dir = "./data/train/"
+  key = sys.argv[1] + "/"
+  img_no = sys.argv[2]
+  img = "image_" + img_no + ".jpg"
 
-  landmarks = get_landmarks(dir + img, show_marks=True)
+  landmarks = get_landmarks(dir + key + img, show_marks=True)
