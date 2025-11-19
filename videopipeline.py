@@ -5,7 +5,7 @@ keys = ["A", "Am", "B", "Bm", "C", "Cm", "D", "Dm", "E", "Em", "F", "Fm", "G", "
 #it seems unlikely the middle pixel method will work well as a classifier. 
 def middle_pixel(frame):
     width, height, _ = frame.shape
-    return frame[height // 2][width // 2][0] // 14
+    return (frame[height // 2][width // 2][0] // 20) % 14
 
 capture = cv2.VideoCapture(0)
 
