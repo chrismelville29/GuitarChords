@@ -1,0 +1,17 @@
+[project]
+name = "jaxnn"
+version = "0.1.0"
+description = "Educational neural network toolkit built on JAX"
+authors = [
+  { name = "Harshvardhan Chandirasekar", email = "chand863@umn.edu" }
+]
+requires-python = ">=3.11"
+dependencies = [
+  "jax",
+  "jaxlib",
+  "numpy"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
