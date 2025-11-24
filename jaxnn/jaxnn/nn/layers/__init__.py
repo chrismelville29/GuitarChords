@@ -6,11 +6,13 @@ from typing import Sequence
 from .base import Layer
 from .conv2d import Conv2D
 from .dense import Dense
+from .batchnorm import BatchNorm
 from .sequential import Sequential
 
 __all__ = [
     "Layer",
     "Dense",
+    "BatchNorm",
     "Sequential",
     "Conv2D",
     "make_mlp",
