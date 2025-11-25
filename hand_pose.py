@@ -7,6 +7,7 @@ import sys
 
 from mediapipe.framework.formats import landmark_pb2
 import numpy as np
+import math
 
 import os
 
@@ -114,7 +115,49 @@ def get_landmarks(im_path, min_detection_confidence=.12, show_marks=False):
                     landmark = hand_world_landmarks[i][j]
                     world_landmarks.append((landmark.x, landmark.y, landmark.z))
             
-        return world_landmarks
+        return np.array(world_landmarks)
+    
+def normalize_hand(hand_pose):
+  """
+  Normalizes hand pose so that point 0 is 0, 0, 0, and point 1 is 0, 0, 1
+  hand_pose: a N(21) by 3 numpy array of hand points
+  returns: a N(21) by 3 numpy array of normalized hand points
+  """
+  A = hand_pose[0] # wrist
+  B = hand_pose[5] # Index finger mcp (base of index finger)
+
+  v = B - A
+  v /= np.linalg.norm(v)
+
+  rotation_axis = np.cross(v, (0, 0, 1))
+  rotation_axis /= np.linalg.norm(rotation_axis)
+  angle = np.arccos(np.dot(v, (0, 0, 1)))  
+
+  cross_product_matrix = np.array([
+     [0, -rotation_axis[2], rotation_axis[1]],
+     [rotation_axis[2], 0, -rotation_axis[0]],
+     [-rotation_axis[1], rotation_axis[0], 0]
+  ])
+
+  rodrigues = np.eye(3) * math.cos(angle) + np.outer(rotation_axis, rotation_axis) * (1 - math.cos(angle)) + cross_product_matrix * math.sin(angle)
+
+  scale_matrix = (1 / np.linalg.norm(B - A)) * np.eye(3)
+
+  scale_rotation = scale_matrix @ rodrigues
+
+  scale_rotation_translation = -scale_matrix @ rodrigues @ hand_pose[0]
+
+  transformation_matrix = np.array(
+     [[scale_rotation[0, 0], scale_rotation[0, 1], scale_rotation[0, 2], scale_rotation_translation[0]],
+     [scale_rotation[1, 0], scale_rotation[1, 1], scale_rotation[1, 2], scale_rotation_translation[1]],
+     [scale_rotation[2, 0], scale_rotation[2, 1], scale_rotation[2, 2], scale_rotation_translation[2]],
+     [0, 0, 0, 1]])
+
+  homogenous_coords = np.hstack((hand_pose, np.ones((hand_pose.shape[0], 1))))
+
+  transformed = homogenous_coords @ transformation_matrix.T
+
+  return transformed[:, :3]
 
 
 if __name__ == "__main__":
@@ -125,4 +168,7 @@ if __name__ == "__main__":
   img_no = sys.argv[2]
   img = "image_" + img_no + ".jpg"
 
-  landmarks = get_landmarks(dir + key + img, show_marks=True)
+  landmarks = get_landmarks(dir + key + img, show_marks=False)
+  normalized_landmarks = normalize_hand(landmarks)
+  print(landmarks)
+  print(normalized_landmarks)
