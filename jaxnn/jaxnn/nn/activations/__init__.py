@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable, Mapping
 
-from .. import types
+from ... import types
 from .gelu import gelu
 from .leaky_relu import leaky_relu
 from .relu import relu

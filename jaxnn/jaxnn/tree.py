@@ -5,7 +5,7 @@ from typing import Callable, Iterable, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax import tree_map, tree_util
+from jax import tree_util
 
 from . import types
 
@@ -20,7 +20,7 @@ def tree_size(tree: PyTree) -> int:
 
 def tree_apply(fn: Callable[..., PyTree], *trees: PyTree) -> PyTree:
     """Map ``fn`` over one or more pytrees with shared structure."""
-    return tree_map(fn, *trees)
+    return tree_util.tree_map(fn, *trees)
 
 
 def tree_l2_norm(tree: PyTree) -> Array:
@@ -33,4 +33,4 @@ def clip_by_global_norm(tree: PyTree, max_norm: float) -> PyTree:
     """Scale all leaves so the pytree has at most ``max_norm`` norm."""
     norm = tree_l2_norm(tree)
     scale = jnp.minimum(1.0, max_norm / (norm + 1e-12))
-    return tree_map(lambda x: x * scale, tree)
+    return tree_util.tree_map(lambda x: x * scale, tree)

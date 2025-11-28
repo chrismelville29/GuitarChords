@@ -26,10 +26,22 @@ class Optimizer(Protocol):
     def update(self, grads: Params, state: OptState, params: Params) -> Tuple[Params, OptState]: ...
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class TrainState:
     params: Params
     opt_state: OptState
 
+    def tree_flatten(self):
+        return (self.params, self.opt_state), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        params, opt_state = children
+        return cls(params=params, opt_state=opt_state)
+
     def replace(self, *, params: Params | None = None, opt_state: OptState | None = None) -> "TrainState":
-        return TrainState(params=params or self.params, opt_state=opt_state or self.opt_state)
+        return TrainState(
+            params=self.params if params is None else params,
+            opt_state=self.opt_state if opt_state is None else opt_state,
+        )

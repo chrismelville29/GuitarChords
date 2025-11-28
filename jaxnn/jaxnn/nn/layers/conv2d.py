@@ -98,7 +98,8 @@ class Conv2D(base.Layer):
         def convolve_at(i: int, j: int) -> Array:
             h_start = i * sh
             w_start = j * sw
-            window = x_padded[h_start : h_start + kh, w_start : w_start + kw, :]
+            # Use dynamic slicing to keep indices JIT-compatible inside vmaps.
+            window = jax.lax.dynamic_slice(x_padded, (h_start, w_start, 0), (kh, kw, x.shape[-1]))
             # Sum over spatial + in_channels to produce one vector per out_channel
             return jnp.tensordot(window, params["w"], axes=([0, 1, 2], [0, 1, 2])) + params["b"]
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
-from .. import types
+from ... import types
 from .tanh import tanh
 
 Array = types.Array

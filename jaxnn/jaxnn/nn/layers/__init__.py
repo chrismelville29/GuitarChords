@@ -3,16 +3,20 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from .activation import Activation
 from .base import Layer
+from .batchnorm import BatchNorm
 from .conv2d import Conv2D
 from .dense import Dense
-from .batchnorm import BatchNorm
+from .flatten import Flatten
 from .sequential import Sequential
 
 __all__ = [
     "Layer",
+    "Activation",
     "Dense",
     "BatchNorm",
+    "Flatten",
     "Sequential",
     "Conv2D",
     "make_mlp",
