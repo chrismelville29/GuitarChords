@@ -21,6 +21,7 @@ DEFAULT_SECONDARY_DATASET_DIR = Path("data/secondary_data")
 SECONDARY_DEFAULT_SPLITS = (0.8, 0.1, 0.1)  # train, valid, test
 SECONDARY_SPLIT_SEED = 1337
 DEFAULT_OUTPUT_DIR = Path("data/guitar-chords_landmarks")
+DEFAULT_SECONDARY_OUTPUT_DIR = Path("data/guitar_chords_landmarks_secondary")
 DEFAULT_ORIGINAL_OUTPUT_DIR = Path("data/guitar-chords_landmarks_original")
 DEFAULT_DEBUG_VIZ_DIR = Path("data/guitar-chords_debug_viz")
 MODEL_PATH = Path("./models/hand_landmarker.task")
@@ -445,6 +446,7 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
                     limit: Optional[int] = None,
                     splits: Optional[Iterable[str]] = None,
                     include_secondary: bool = False,
+                    secondary_only: bool = False,
                     secondary_dir: Path = DEFAULT_SECONDARY_DATASET_DIR,
                     secondary_valid_frac: float = SECONDARY_DEFAULT_SPLITS[1],
                     secondary_test_frac: float = SECONDARY_DEFAULT_SPLITS[2],
@@ -454,10 +456,18 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
   Downloads (if necessary) and processes the dataset into 20-point wrist-normalized npy files by default,
   or preserves the original 21-point coordinates when keep_original=True.
   Optionally also folds in the local ./data/secondary_data set by auto-splitting it into
-  train/valid/test before processing.
+  train/valid/test before processing. When secondary_only=True, only the secondary dataset is processed
+  (no primary download) and, if the output dir is left default, results are written under
+  data/guitar_chords_landmarks_secondary.
   """
-  dataset_dir = download_guitar_chords_dataset(dataset_dir)
+  include_secondary = include_secondary or secondary_only
+
+  dataset_dir = Path(dataset_dir)
+  if not secondary_only:
+    dataset_dir = download_guitar_chords_dataset(dataset_dir)
   output_dir = Path(output_dir)
+  if secondary_only and output_dir == DEFAULT_OUTPUT_DIR:
+    output_dir = DEFAULT_SECONDARY_OUTPUT_DIR
   if keep_original and output_dir == DEFAULT_OUTPUT_DIR:
     output_dir = DEFAULT_ORIGINAL_OUTPUT_DIR
   debug_viz_dir = Path(debug_viz_dir)
@@ -467,10 +477,11 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
 
   images: list[tuple[Path, Path]] = []
 
-  primary_images = _iter_image_files(dataset_dir, splits=splits)
-  for image_path in primary_images:
-    rel_path = image_path.relative_to(dataset_dir)
-    images.append((image_path, rel_path))
+  if not secondary_only:
+    primary_images = _iter_image_files(dataset_dir, splits=splits)
+    for image_path in primary_images:
+      rel_path = image_path.relative_to(dataset_dir)
+      images.append((image_path, rel_path))
 
   secondary_counts = None
   if include_secondary:
@@ -579,6 +590,8 @@ if __name__ == "__main__":
                       help="Print image counts per split and chord for the dataset directory.")
   parser.add_argument("--include-secondary", action="store_true",
                       help="Also process ./data/secondary_data by auto-splitting it into train/valid/test.")
+  parser.add_argument("--secondary_only", action="store_true",
+                      help="Process only the secondary dataset; defaults output to data/guitar_chords_landmarks_secondary.")
   parser.add_argument("--secondary-dir", type=Path, default=DEFAULT_SECONDARY_DATASET_DIR,
                       help="Root directory for the raw secondary dataset.")
   parser.add_argument("--secondary-valid-frac", type=float, default=SECONDARY_DEFAULT_SPLITS[1],
@@ -591,6 +604,8 @@ if __name__ == "__main__":
 
   ran = False
   dataset_output_dir = args.output_dir
+  if args.secondary_only and dataset_output_dir == DEFAULT_OUTPUT_DIR:
+    dataset_output_dir = DEFAULT_SECONDARY_OUTPUT_DIR
   if args.original and dataset_output_dir == DEFAULT_OUTPUT_DIR:
     dataset_output_dir = DEFAULT_ORIGINAL_OUTPUT_DIR
 
@@ -618,6 +633,7 @@ if __name__ == "__main__":
                     limit=args.limit,
                     splits=args.splits,
                     include_secondary=args.include_secondary,
+                    secondary_only=args.secondary_only,
                     secondary_dir=args.secondary_dir,
                     secondary_valid_frac=args.secondary_valid_frac,
                     secondary_test_frac=args.secondary_test_frac,

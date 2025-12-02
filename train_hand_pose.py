@@ -15,11 +15,16 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import pickle
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Sequence, Tuple
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None  # type: ignore
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +38,7 @@ from jaxnn.nn.layers.batchnorm import BatchNorm
 from jaxnn.optim import base as optim_base
 from jaxnn.optim.adam import Adam
 from jaxnn.optim.schedule import cosine_decay_schedule
+from jaxnn.models.hand_graph_attention import HandGraphAttentionNetwork, hand_graph_features
 
 try:  # Prefer PyTorch's writer when available.
     from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
@@ -117,7 +123,81 @@ def _resolve_log_dir(cli_value: Path | None) -> Path:
     return Path("runs") / timestamp
 
 
+def _save_checkpoint(
+    path: Path,
+    state: optim_base.TrainState,
+    *,
+    epoch: int,
+    global_step: int,
+    best_val_acc: float,
+    best_epoch: int,
+    class_names: Sequence[str],
+    channel_mean: np.ndarray,
+    channel_std: np.ndarray,
+    model_type: str,
+    representation: str,
+    include_wrist: bool,
+    data_rng_state: dict | None,
+    swa_params: Params | None,
+    swa_count: int,
+) -> None:
+    """Persist training state for reproducible resumption/evaluation."""
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "params": jax.device_get(state.params),
+        "opt_state": jax.device_get(state.opt_state),
+        "best_val_acc": float(best_val_acc),
+        "best_epoch": int(best_epoch),
+        "class_names": list(class_names),
+        "channel_mean": np.array(channel_mean),
+        "channel_std": np.array(channel_std),
+        "model_type": model_type,
+        "representation": representation,
+        "include_wrist": include_wrist,
+        "data_rng_state": data_rng_state,
+        "swa_params": jax.device_get(swa_params) if swa_params is not None else None,
+        "swa_count": int(swa_count),
+    }
+
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    """Load checkpoint dictionary from disk."""
+
+    with open(path.expanduser().resolve(), "rb") as f:
+        return pickle.load(f)
+
+
 # ----------------------------- Data utilities ----------------------------- #
+
+
+def _augment_landmarks(landmarks: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply rotation/scale/translation/noise jitter to landmark coordinates."""
+
+    augmented = np.array(landmarks, dtype=np.float32, copy=True)
+
+    angle = rng.uniform(-0.15, 0.15)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot_matrix = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]], dtype=np.float32)
+    augmented = augmented @ rot_matrix.T
+
+    scale = rng.uniform(0.95, 1.05)
+    augmented = augmented * scale
+
+    translation = rng.uniform(-0.02, 0.02, size=3)
+    augmented = augmented + translation
+
+    noise = rng.normal(0, 0.005, size=augmented.shape)
+    augmented = augmented + noise
+
+    return augmented.astype(np.float32)
 
 
 def _finger_grid(
@@ -141,30 +221,14 @@ def _finger_grid(
     if landmarks.shape != (20, 3):
         raise ValueError(f"Expected landmarks with shape (20, 3), got {landmarks.shape}")
 
-    # Apply data augmentation if requested
+    coords = np.array(landmarks, dtype=np.float32, copy=True)
     if augment and rng is not None:
-        # Small random rotation around z-axis (mimics slight hand rotation)
-        angle = rng.uniform(-0.15, 0.15)  # ±~9 degrees
-        cos_a, sin_a = np.cos(angle), np.sin(angle)
-        rot_matrix = np.array([[cos_a, -sin_a, 0], [sin_a, cos_a, 0], [0, 0, 1]])
-        landmarks = landmarks @ rot_matrix.T
-
-        # Small random scaling (mimics distance variation)
-        scale = rng.uniform(0.95, 1.05)
-        landmarks = landmarks * scale
-
-        # Small random translation
-        translation = rng.uniform(-0.02, 0.02, size=3)
-        landmarks = landmarks + translation
-
-        # Add small Gaussian noise
-        noise = rng.normal(0, 0.005, size=landmarks.shape)
-        landmarks = landmarks + noise
+        coords = _augment_landmarks(coords, rng)
 
     joints_per_finger = []
     for finger_idx in range(5):
         start = finger_idx * 4
-        joints_per_finger.append(landmarks[start : start + 4])
+        joints_per_finger.append(coords[start : start + 4])
 
     # Stack fingers along the second axis: (4 joints, 5 fingers, 3 channels)
     grid = np.stack(joints_per_finger, axis=1).astype(np.float32)
@@ -174,6 +238,56 @@ def _finger_grid(
         grid = (grid - mean) / (std + 1e-6)
 
     return grid
+
+
+def _hand_graph_inputs(
+    landmarks: np.ndarray,
+    *,
+    augment: bool = False,
+    rng: np.random.Generator | None = None,
+    norm_stats: tuple[np.ndarray, np.ndarray] | None = None,
+    include_wrist: bool = True,
+) -> np.ndarray:
+    """Prepare (N, F) graph features compatible with HandGraphAttentionNetwork."""
+
+    coords = np.array(landmarks, dtype=np.float32, copy=True)
+    if include_wrist:
+        if coords.shape == (20, 3):
+            coords = np.vstack([np.zeros((1, 3), dtype=coords.dtype), coords])
+        elif coords.shape != (21, 3):
+            raise ValueError(f"Expected 20 or 21 points, got shape {coords.shape}")
+    else:
+        if coords.shape == (21, 3):
+            coords = coords[1:]
+        elif coords.shape != (20, 3):
+            raise ValueError(f"Expected 20 or 21 points, got shape {coords.shape}")
+
+    if augment and rng is not None:
+        coords = _augment_landmarks(coords, rng)
+
+    return hand_graph_features(coords, include_wrist=include_wrist, norm_stats=norm_stats)
+
+
+def _prepare_landmark_sample(
+    landmarks: np.ndarray,
+    *,
+    representation: str,
+    augment: bool,
+    rng: np.random.Generator | None,
+    norm_stats: tuple[np.ndarray, np.ndarray] | None,
+    include_wrist: bool,
+) -> np.ndarray:
+    if representation == "grid":
+        return _finger_grid(landmarks, augment=augment, rng=rng, norm_stats=norm_stats)
+    if representation == "graph":
+        return _hand_graph_inputs(
+            landmarks,
+            augment=augment,
+            rng=rng,
+            norm_stats=norm_stats,
+            include_wrist=include_wrist,
+        )
+    raise ValueError(f"Unknown representation: {representation}")
 
 
 def _collect_split(split_dir: Path, class_names: Sequence[str] | None = None) -> tuple[List[tuple[Path, int]], List[str]]:
@@ -213,15 +327,24 @@ def _compute_class_weights(counts: Counter) -> np.ndarray:
     return weights_arr / np.mean(weights_arr)
 
 
-def _compute_channel_mean_std(samples: Sequence[tuple[Path, int]]) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-channel (x,y,z) mean/std over all landmark points in samples."""
+def _compute_channel_mean_std(
+    samples: Sequence[tuple[Path, int]],
+    *,
+    include_wrist: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-channel (x,y,z) mean/std with optional wrist reinsertion."""
 
     total_points = 0
     sum_channels = np.zeros(3, dtype=np.float64)
     sumsq_channels = np.zeros(3, dtype=np.float64)
 
     for path, _ in samples:
-        arr = np.load(path)  # shape (20, 3)
+        arr = np.load(path)  # shape (20, 3) unless dataset exported with wrist
+        if include_wrist:
+            if arr.shape[0] == 20:
+                arr = np.vstack([np.zeros((1, arr.shape[1]), dtype=arr.dtype), arr])
+            elif arr.shape[0] != 21:
+                raise ValueError(f"Expected 20 or 21 landmarks, got {arr.shape}")
         sum_channels += arr.sum(axis=0)
         sumsq_channels += np.square(arr).sum(axis=0)
         total_points += arr.shape[0]
@@ -281,11 +404,14 @@ def batch_iterator(
     oversample: bool = True,
     augment: bool = False,
     seed: int = 0,
+    rng: np.random.Generator | None = None,
     norm_stats: tuple[np.ndarray, np.ndarray] | None = None,
+    representation: str = "grid",
+    include_wrist: bool = False,
 ) -> Iterator[dict[str, np.ndarray]]:
     """Yield batches with inputs, labels, and per-example weights."""
 
-    rng = np.random.default_rng(seed)
+    rng = rng or np.random.default_rng(seed)
 
     # Organize files by label for oversampling
     class_to_files: dict[int, list[Path]] = defaultdict(list)
@@ -310,7 +436,16 @@ def batch_iterator(
             ws = []
             for path, label in batch_paths:
                 arr = np.load(path)
-                xs.append(_finger_grid(arr, augment=augment, rng=rng, norm_stats=norm_stats))
+                xs.append(
+                    _prepare_landmark_sample(
+                        arr,
+                        representation=representation,
+                        augment=augment,
+                        rng=rng,
+                        norm_stats=norm_stats,
+                        include_wrist=include_wrist,
+                    )
+                )
                 ys.append(label)
                 ws.append(class_weights[label])
 
@@ -678,8 +813,14 @@ def run_training(
     learning_rate: float,
     model_type: str = "baseline",
     resnet_width_mult: float = 1.0,
+    gat_hidden_dim: int = 96,
+    gat_heads: int = 4,
+    gat_layers: int = 3,
+    gat_readout: str = "mean",
     lr_schedule: str = "constant",
     min_learning_rate: float = 1e-5,
+    lr_decay_steps: int | None = None,
+    lr_warmup_steps: int = 0,
     use_swa: bool = False,
     swa_start_epoch: int = 10,
     seed: int = 0,
@@ -692,11 +833,28 @@ def run_training(
     augment: bool = True,
     fast_training: bool = False,
     log_dir: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    resume_from: Path | None = None,
+    checkpoint_every: int = 0,
 ) -> None:
     if swa_start_epoch < 0:
         raise ValueError("swa_start_epoch must be non-negative")
     if min_learning_rate < 0:
         raise ValueError("min_learning_rate must be non-negative")
+    if lr_decay_steps is not None and lr_decay_steps <= 0:
+        raise ValueError("lr_decay_steps must be positive when provided")
+    if lr_warmup_steps < 0:
+        raise ValueError("lr_warmup_steps must be non-negative")
+
+    if checkpoint_dir is None:
+        if log_dir is None:
+            checkpoint_dir = Path("runs") / "checkpoints"
+        else:
+            checkpoint_dir = Path(log_dir) / "checkpoints"
+    checkpoint_dir = checkpoint_dir.expanduser().resolve()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_ckpt_path = checkpoint_dir / "best.pkl"
+    last_ckpt_path = checkpoint_dir / "last.pkl"
 
     train_dir = data_root / "train"
     valid_dir = data_root / "valid"
@@ -722,9 +880,14 @@ def run_training(
     train_samples, class_names = _collect_split(train_dir, class_names=class_names)
     valid_samples, _ = _collect_split(valid_dir, class_names=class_names)
 
+    representation = "graph" if model_type == "gat" else "grid"
+    include_wrist = representation == "graph"
+
     # Compute input normalization stats on the training set (channel-wise x/y/z).
-    channel_mean, channel_std = _compute_channel_mean_std(train_samples)
-    print(f"Input normalization (mean/std per channel):")
+    channel_mean, channel_std = _compute_channel_mean_std(
+        train_samples, include_wrist=include_wrist
+    )
+    print("Input normalization (mean/std per channel):")
     print(f"  mean: {np.round(channel_mean, 4)}")
     print(f"  std : {np.round(channel_std, 4)}")
 
@@ -775,26 +938,60 @@ def run_training(
 
     if model_type == "baseline":
         network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
+        model_desc = f"baseline (use_lax_conv={fast_training})"
     elif model_type == "resnet":
         network = build_resnet_model(
             num_classes=len(class_names),
             use_lax_conv=fast_training,
             width_mult=resnet_width_mult,
         )
+        model_desc = f"resnet (width_mult={resnet_width_mult}, use_lax_conv={fast_training})"
+    elif model_type == "gat":
+        network = HandGraphAttentionNetwork(
+            num_classes=len(class_names),
+            hidden_dim=gat_hidden_dim,
+            num_layers=gat_layers,
+            num_heads=gat_heads,
+            readout=gat_readout,
+            include_wrist=include_wrist,
+        )
+        model_desc = (
+            "gat ("
+            f"hidden_dim={gat_hidden_dim}, heads={gat_heads}, layers={gat_layers}, readout={gat_readout})"
+        )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    print(f"Model: {model_type} (width_mult={resnet_width_mult if model_type == 'resnet' else 'n/a'}, "
-          f"use_lax_conv={fast_training})")
+    print(f"Model: {model_desc}")
 
     rng = jax.random.PRNGKey(seed)
     params = network.init(rng)
 
+    decay_steps = lr_decay_steps or epochs * steps
+    warmup_steps = max(0, lr_warmup_steps)
+    decay_span = max(decay_steps - warmup_steps, 1)
+
     if lr_schedule == "constant":
         lr_sched_fn = None
     elif lr_schedule == "cosine":
-        total_steps = epochs * steps
-        lr_sched_fn = cosine_decay_schedule(initial_lr=learning_rate, final_lr=min_learning_rate, total_steps=total_steps)
+        def lr_sched_fn(step):
+            """JIT-safe cosine decay with optional linear warmup."""
+            step_f = jnp.asarray(step, dtype=jnp.float32)
+            warm = jnp.asarray(warmup_steps, dtype=jnp.float32)
+            base_lr = jnp.asarray(learning_rate, dtype=jnp.float32)
+            final_lr = jnp.asarray(min_learning_rate, dtype=jnp.float32)
+            decay_total = jnp.asarray(decay_span, dtype=jnp.float32)
+
+            # Linear warmup from 0 -> base_lr over warmup steps (inclusive of step 0)
+            warm_denom = jnp.maximum(warm, 1.0)
+            warm_lr = base_lr * (step_f + 1.0) / warm_denom
+
+            # Cosine decay after warmup
+            t = jnp.maximum(step_f - warm + 1.0, 0.0)
+            progress = jnp.minimum(t / jnp.maximum(decay_total, 1.0), 1.0)
+            cosine_lr = final_lr + 0.5 * (base_lr - final_lr) * (1.0 + jnp.cos(jnp.pi * progress))
+
+            return jnp.where(step_f < warm, warm_lr, cosine_lr)
     else:
         raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
 
@@ -808,40 +1005,131 @@ def run_training(
     opt_state = optimizer.init(params)
     state = optim_base.TrainState(params, opt_state)
 
-    stat_mask = _running_stat_mask(params)
-    train_step = make_train_step(network, optimizer, weight_decay=1e-4, stat_mask=stat_mask)
-    eval_step = make_eval_step(network)
+    data_rng = np.random.default_rng(seed)
 
-    summary_writer = _create_summary_writer(log_dir)
     global_step = 0
     best_val_acc = -np.inf
     best_epoch = 0
     swa_params: Params | None = None
     swa_count = 0
+    start_epoch = 1
+
+    if resume_from is not None:
+        ckpt = _load_checkpoint(resume_from)
+        state = optim_base.TrainState(
+            params=jax.device_put(ckpt["params"]),
+            opt_state=jax.device_put(ckpt["opt_state"]),
+        )
+        best_val_acc = ckpt.get("best_val_acc", best_val_acc)
+        best_epoch = ckpt.get("best_epoch", best_epoch)
+        global_step = ckpt.get("global_step", global_step)
+        start_epoch = ckpt.get("epoch", 0) + 1
+        data_rng_state = ckpt.get("data_rng_state")
+        if data_rng_state is not None:
+            data_rng.bit_generator.state = data_rng_state
+        swa_params = ckpt.get("swa_params")
+        if swa_params is not None:
+            swa_params = jax.device_put(swa_params)
+        swa_count = ckpt.get("swa_count", swa_count)
+        ckpt_classes = ckpt.get("class_names")
+        if ckpt_classes is not None and list(ckpt_classes) != list(class_names):
+            raise ValueError(
+                "Checkpoint classes do not match dataset classes; refusing to resume to avoid label mismatch."
+            )
+        ckpt_mean = ckpt.get("channel_mean")
+        ckpt_std = ckpt.get("channel_std")
+        if ckpt_mean is not None and not np.allclose(ckpt_mean, channel_mean, atol=1e-5):
+            print("WARNING: Checkpoint channel mean differs from current data stats.")
+        if ckpt_std is not None and not np.allclose(ckpt_std, channel_std, atol=1e-5):
+            print("WARNING: Checkpoint channel std differs from current data stats.")
+        print(f"Resumed from checkpoint {resume_from} at epoch {start_epoch - 1} (global_step={global_step}).")
+
+    stat_mask = _running_stat_mask(state.params)
+    train_step = make_train_step(network, optimizer, weight_decay=1e-4, stat_mask=stat_mask)
+    eval_step = make_eval_step(network)
+
+    summary_writer = _create_summary_writer(log_dir)
 
     train_iter = batch_iterator(
         train_samples,
         class_weights,
         batch_size,
-        seed=seed,
+        rng=data_rng,
         oversample=oversample,
         augment=augment,
         norm_stats=(channel_mean, channel_std),
+        representation=representation,
+        include_wrist=include_wrist,
     )
 
-    for epoch in range(1, epochs + 1):
+    if start_epoch > epochs:
+        print(f"Checkpoint epoch {start_epoch - 1} >= requested epochs={epochs}; skipping training.")
+        if summary_writer is not None:
+            summary_writer.close()
+        return
+
+    epoch_iter = (
+        tqdm(
+            range(start_epoch, epochs + 1),
+            desc="Epochs",
+            initial=start_epoch - 1,
+            total=epochs,
+            dynamic_ncols=True,
+        )
+        if tqdm is not None
+        else range(start_epoch, epochs + 1)
+    )
+
+    for epoch in epoch_iter:
         epoch_losses = []
-        for step_idx in range(steps):
+        epoch_accs = []
+        step_iter = (
+            tqdm(range(steps), desc=f"Epoch {epoch}", leave=False, dynamic_ncols=True)
+            if tqdm is not None
+            else range(steps)
+        )
+        for step_idx in step_iter:
             batch_np = next(train_iter)
             batch = {k: jnp.array(v) for k, v in batch_np.items()}
             # Generate fresh RNG key for each batch for dropout
             step_rng = jax.random.fold_in(rng, epoch * steps + step_idx)
             state, loss_value = train_step(state, batch, step_rng)
             epoch_losses.append(float(loss_value))
+            # Compute training accuracy on this batch (post-update, eval mode).
+            logits = network.apply(state.params, batch["x"], rng=None, is_training=False)
+            preds = jnp.argmax(logits, axis=-1)
+            batch_acc = float(jnp.mean(preds == batch["y"]))
+            epoch_accs.append(batch_acc)
+            current_lr = _current_lr(state.opt_state.step)
             if summary_writer is not None:
                 summary_writer.add_scalar("loss/train_batch", float(loss_value), global_step)
-                summary_writer.add_scalar("lr", _current_lr(state.opt_state.step), global_step)
+                summary_writer.add_scalar("accuracy/train_batch", batch_acc, global_step)
+                summary_writer.add_scalar("lr", current_lr, global_step)
+            if tqdm is not None:
+                step_iter.set_postfix(loss=float(loss_value), acc=batch_acc, lr=current_lr)
             global_step += 1
+
+            if checkpoint_every > 0 and global_step % checkpoint_every == 0:
+                step_ckpt_path = checkpoint_dir / f"step_{global_step:09d}.pkl"
+                _save_checkpoint(
+                    step_ckpt_path,
+                    state,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_val_acc=best_val_acc,
+                    best_epoch=best_epoch,
+                    class_names=class_names,
+                    channel_mean=channel_mean,
+                    channel_std=channel_std,
+                    model_type=model_type,
+                    representation=representation,
+                    include_wrist=include_wrist,
+                    data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
+                    swa_params=swa_params if use_swa else None,
+                    swa_count=swa_count if use_swa else 0,
+                )
+        if tqdm is not None:
+            step_iter.close()
 
         # Validation on the entire validation set (reset each epoch for consistency)
         if valid_samples:
@@ -860,7 +1148,16 @@ def run_training(
                 ws = []
                 for path, label in batch_samples:
                     arr = np.load(path)
-                    xs.append(_finger_grid(arr, norm_stats=(channel_mean, channel_std)))
+                    xs.append(
+                        _prepare_landmark_sample(
+                            arr,
+                            representation=representation,
+                            augment=False,
+                            rng=None,
+                            norm_stats=(channel_mean, channel_std),
+                            include_wrist=include_wrist,
+                        )
+                    )
                     ys.append(label)
                     ws.append(class_weights[label])
 
@@ -897,10 +1194,14 @@ def run_training(
             avg_val_acc = 0.0
 
         train_epoch_loss = np.mean(epoch_losses)
+        train_epoch_acc = np.mean(epoch_accs) if epoch_accs else 0.0
+        epoch_lr = _current_lr(state.opt_state.step)
 
+        improved = False
         if avg_val_acc > best_val_acc:
             best_val_acc = avg_val_acc
             best_epoch = epoch
+            improved = True
 
         # Stochastic Weight Averaging: start averaging from max(best_epoch, swa_start_epoch)
         if use_swa and epoch >= max(best_epoch, swa_start_epoch):
@@ -916,15 +1217,54 @@ def run_training(
                 swa_count += 1
 
         print(
-            f"Epoch {epoch:02d} | train_loss={train_epoch_loss:.4f} "
-            f"val_loss={avg_val_loss:.4f} val_acc={avg_val_acc:.4f}"
+            f"Epoch {epoch:02d} | train_loss={train_epoch_loss:.4f} train_acc={train_epoch_acc:.4f} "
+            f"val_loss={avg_val_loss:.4f} val_acc={avg_val_acc:.4f} lr={epoch_lr:.6g}"
         )
 
         if summary_writer is not None:
             summary_writer.add_scalar("loss/train_epoch", float(train_epoch_loss), epoch)
+            summary_writer.add_scalar("accuracy/train_epoch", float(train_epoch_acc), epoch)
             summary_writer.add_scalar("loss/val", float(avg_val_loss), epoch)
             summary_writer.add_scalar("accuracy/val", float(avg_val_acc), epoch)
+            summary_writer.add_scalar("lr_epoch", float(epoch_lr), epoch)
             summary_writer.flush()
+
+        _save_checkpoint(
+            last_ckpt_path,
+            state,
+            epoch=epoch,
+            global_step=global_step,
+            best_val_acc=best_val_acc,
+            best_epoch=best_epoch,
+            class_names=class_names,
+            channel_mean=channel_mean,
+            channel_std=channel_std,
+            model_type=model_type,
+            representation=representation,
+            include_wrist=include_wrist,
+            data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
+            swa_params=swa_params if use_swa else None,
+            swa_count=swa_count if use_swa else 0,
+        )
+
+        if improved:
+            _save_checkpoint(
+                best_ckpt_path,
+                state,
+                epoch=epoch,
+                global_step=global_step,
+                best_val_acc=best_val_acc,
+                best_epoch=best_epoch,
+                class_names=class_names,
+                channel_mean=channel_mean,
+                channel_std=channel_std,
+                model_type=model_type,
+                representation=representation,
+                include_wrist=include_wrist,
+                data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
+                swa_params=swa_params if use_swa else None,
+                swa_count=swa_count if use_swa else 0,
+            )
 
     # Optionally swap to SWA-averaged weights for final model use.
     if use_swa and swa_params is not None:
@@ -933,7 +1273,29 @@ def run_training(
     else:
         print("SWA disabled or not triggered; final params come from the last epoch.")
 
+    # Save a final checkpoint reflecting any SWA swap.
+    _save_checkpoint(
+        last_ckpt_path,
+        state,
+        epoch=epochs,
+        global_step=global_step,
+        best_val_acc=best_val_acc,
+        best_epoch=best_epoch,
+        class_names=class_names,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+        model_type=model_type,
+        representation=representation,
+        include_wrist=include_wrist,
+        data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
+        swa_params=swa_params if use_swa else None,
+        swa_count=swa_count if use_swa else 0,
+    )
+
     print("Training complete. You can now use `network.apply` with the learned params.")
+    print(f"Checkpoints written to {checkpoint_dir} (last.pkl, best.pkl).")
+    if tqdm is not None and hasattr(epoch_iter, "close"):
+        epoch_iter.close()
     if summary_writer is not None:
         summary_writer.close()
 
@@ -941,6 +1303,14 @@ def run_training(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a small hand-pose CNN using jaxnn.")
     parser.add_argument("--data-root", type=Path, default=Path("data/guitar-chords_landmarks"), help="Root directory with train/valid/test chord folders.")
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        help=(
+            "Optional override for the dataset root. Use this to point at the secondary-only "
+            "export (e.g. data/guitar_chords_landmarks_secondary). If omitted, falls back to --data-root."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -948,10 +1318,42 @@ def main() -> None:
                         help="Learning rate schedule (default constant).")
     parser.add_argument("--min-learning-rate", type=float, default=1e-5,
                         help="Final learning rate for cosine decay.")
-    parser.add_argument("--model-type", choices=["baseline", "resnet"], default="baseline",
-                        help="Choose between the original CNN ('baseline') and a deeper residual model ('resnet').")
+    parser.add_argument("--lr-decay-steps", type=int,
+                        help="Override number of steps used for LR decay (defaults to epochs * steps_per_epoch).")
+    parser.add_argument("--lr-warmup-steps", type=int, default=0,
+                        help="Linear warmup steps before applying the decay schedule.")
+    parser.add_argument(
+        "--model-type",
+        choices=["baseline", "resnet", "gat"],
+        default="baseline",
+        help="Select the baseline CNN, the residual CNN, or the new graph attention network ('gat').",
+    )
     parser.add_argument("--resnet-width-mult", type=float, default=1.0,
                         help="Width multiplier for the ResNet channels (only used when --model-type=resnet).")
+    parser.add_argument(
+        "--gat-hidden-dim",
+        type=int,
+        default=96,
+        help="Hidden feature size per node for the graph attention model (only used with --model-type=gat).",
+    )
+    parser.add_argument(
+        "--gat-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads per GAT layer (only used with --model-type=gat).",
+    )
+    parser.add_argument(
+        "--gat-layers",
+        type=int,
+        default=3,
+        help="Number of stacked GraphAttentionTransformer layers (only used with --model-type=gat).",
+    )
+    parser.add_argument(
+        "--gat-readout",
+        choices=["mean", "max"],
+        default="mean",
+        help="Graph readout aggregation to convert node embeddings into logits (only for --model-type=gat).",
+    )
     parser.add_argument("--use-swa", action="store_true",
                         help="Enable Stochastic Weight Averaging starting after swa-start-epoch and the best val epoch.")
     parser.add_argument("--swa-start-epoch", type=int, default=10,
@@ -979,19 +1381,43 @@ def main() -> None:
             "when not provided."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Directory to store checkpoints (defaults to <log-dir>/checkpoints).",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="Path to a checkpoint .pkl file to resume training from.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="If >0, also save a checkpoint every N training steps (in addition to per-epoch/best).",
+    )
 
     args = parser.parse_args()
     resolved_log_dir = _resolve_log_dir(args.log_dir)
 
+    data_root = args.dataset_path or args.data_root
+
     run_training(
-        data_root=args.data_root,
+        data_root=data_root,
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         model_type=args.model_type,
         resnet_width_mult=args.resnet_width_mult,
+        gat_hidden_dim=args.gat_hidden_dim,
+        gat_heads=args.gat_heads,
+        gat_layers=args.gat_layers,
+        gat_readout=args.gat_readout,
         lr_schedule=args.lr_schedule,
         min_learning_rate=args.min_learning_rate,
+        lr_decay_steps=args.lr_decay_steps,
+        lr_warmup_steps=args.lr_warmup_steps,
         use_swa=args.use_swa,
         swa_start_epoch=args.swa_start_epoch,
         seed=args.seed,
@@ -1003,6 +1429,9 @@ def main() -> None:
         augment=not args.no_augment,
         fast_training=args.fast_training,
         log_dir=resolved_log_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        resume_from=args.resume_from,
+        checkpoint_every=args.checkpoint_every,
     )
 
 
