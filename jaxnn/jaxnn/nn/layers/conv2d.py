@@ -36,16 +36,11 @@ class Conv2D(base.Layer):
             raise ValueError("in_channels and out_channels must be positive")
 
     def _conv_kernel_init(self, rng: PRNGKey) -> Array:
-        """Glorot-uniform for conv kernels that accounts for spatial extent."""
+        """Default Kaiming/MSRA init scaled by receptive field size."""
         kh, kw = self.kernel_size
-        fan_in = kh * kw * self.in_channels
-        fan_out = kh * kw * self.out_channels
-        limit = jnp.sqrt(6.0 / (fan_in + fan_out))
-        return jax.random.uniform(
+        return initializers.he_normal_conv2d(
             rng,
             (kh, kw, self.in_channels, self.out_channels),
-            minval=-limit,
-            maxval=limit,
         )
 
     def init(self, rng: PRNGKey) -> Params:

@@ -1,3 +1,6 @@
 data
 .venv
 venv
+jaxnn/build
+jaxnn/jaxnn.egg-info
+__pycache__

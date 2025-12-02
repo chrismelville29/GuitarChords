@@ -58,6 +58,20 @@ class MyOptimizer(base.Optimizer):
   2. Compute bias-corrected estimates using `step`.
   3. Form updates `-lr * m_hat / (sqrt(v_hat) + eps)` and apply with `base.apply_updates`.
 
+## Learning rate schedules
+
+Both `SGD` and `Adam` accept an optional `lr_schedule` callable with signature `(step: int) -> lr`. When provided, the schedule output overrides the static `learning_rate`/`lr` for that step and increments the stored `step` counter automatically.
+
+Use `jaxnn.optim.schedule.cosine_decay_schedule` to anneal from an initial LR to a final LR:
+
+```python
+from jaxnn.optim.sgd import SGD
+from jaxnn.optim.schedule import cosine_decay_schedule
+
+schedule = cosine_decay_schedule(initial_lr=0.1, final_lr=0.0, total_steps=10_000)
+optimizer = SGD(learning_rate=0.1, momentum=0.9, lr_schedule=schedule)
+```
+
 ## Testing checklist
 
 - **Shapes:** `opt_state` leaves match `params` leaves for all supported parameter shapes.

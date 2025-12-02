@@ -1,4 +1,5 @@
 import math
+import random
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -16,6 +17,9 @@ HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
 
 DATASET_REPO = "dduka/guitar-chords"
 DEFAULT_DATASET_DIR = Path("data/guitar-chords")
+DEFAULT_SECONDARY_DATASET_DIR = Path("data/secondary_data")
+SECONDARY_DEFAULT_SPLITS = (0.8, 0.1, 0.1)  # train, valid, test
+SECONDARY_SPLIT_SEED = 1337
 DEFAULT_OUTPUT_DIR = Path("data/guitar-chords_landmarks")
 DEFAULT_DEBUG_VIZ_DIR = Path("data/guitar-chords_debug_viz")
 MODEL_PATH = Path("./models/hand_landmarker.task")
@@ -323,6 +327,65 @@ def _iter_image_files(root: Path, splits: Optional[Iterable[str]] = None) -> lis
       image_files.extend(sorted(search_dir.rglob("*.jpg")))
   return sorted(image_files)
 
+
+def _prepare_secondary_images(root: Path,
+                              valid_frac: float = SECONDARY_DEFAULT_SPLITS[1],
+                              test_frac: float = SECONDARY_DEFAULT_SPLITS[2],
+                              seed: int = SECONDARY_SPLIT_SEED) -> tuple[list[tuple[Path, Path]], dict[str, int]]:
+  """
+  Splits an unsplit secondary dataset into train/valid/test and returns output-relative paths.
+  Images are renamed with a 'secondary_' prefix to avoid collisions with the primary dataset.
+  """
+  root = Path(root)
+  source_root = root / "train" if (root / "train").exists() else root
+
+  if valid_frac < 0 or test_frac < 0:
+    raise ValueError("Secondary split fractions must be non-negative.")
+  if valid_frac + test_frac >= 1.0:
+    raise ValueError("valid_frac + test_frac must be < 1.0 for the secondary dataset.")
+
+  train_frac = 1.0 - valid_frac - test_frac
+  rng = random.Random(seed)
+
+  prepared: list[tuple[Path, Path]] = []
+  split_counts: dict[str, int] = {"train": 0, "valid": 0, "test": 0}
+
+  for chord_dir in sorted([p for p in source_root.iterdir() if p.is_dir()]):
+    image_paths = sorted(chord_dir.glob("*.jpg"))
+    if not image_paths:
+      continue
+
+    rng.shuffle(image_paths)
+    total = len(image_paths)
+
+    train_count = int(total * train_frac)
+    valid_count = int(total * valid_frac)
+
+    # Guarantee at least one training example when images are present.
+    if total > 0 and train_count == 0:
+      train_count = 1
+
+    # Avoid over-allocation from rounding.
+    if train_count + valid_count > total:
+      valid_count = max(0, total - train_count)
+
+    test_count = total - train_count - valid_count
+
+    split_slices = {
+        "train": image_paths[:train_count],
+        "valid": image_paths[train_count:train_count + valid_count],
+        "test": image_paths[train_count + valid_count:],
+    }
+
+    for split_name, paths in split_slices.items():
+      for img_path in paths:
+        # Prefix filename to avoid clobbering primary dataset samples.
+        rel_path = Path(split_name) / chord_dir.name / f"secondary_{img_path.name}"
+        prepared.append((img_path, rel_path))
+        split_counts[split_name] += 1
+
+  return prepared, split_counts
+
 def _count_images_in_dir(directory: Path) -> int:
   return sum(1 for _ in directory.glob("*.jpg"))
 
@@ -379,25 +442,58 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
                     min_detection_confidence: float = DEFAULT_MIN_HAND_DETECTION_CONFIDENCE,
                     debug_viz_dir: Path = DEFAULT_DEBUG_VIZ_DIR,
                     limit: Optional[int] = None,
-                    splits: Optional[Iterable[str]] = None):
+                    splits: Optional[Iterable[str]] = None,
+                    include_secondary: bool = False,
+                    secondary_dir: Path = DEFAULT_SECONDARY_DATASET_DIR,
+                    secondary_valid_frac: float = SECONDARY_DEFAULT_SPLITS[1],
+                    secondary_test_frac: float = SECONDARY_DEFAULT_SPLITS[2],
+                    secondary_seed: int = SECONDARY_SPLIT_SEED):
   """
   Downloads (if necessary) and processes the dataset into 20-point wrist-normalized npy files.
+  Optionally also folds in the local ./data/secondary_data set by auto-splitting it into
+  train/valid/test before processing.
   """
   dataset_dir = download_guitar_chords_dataset(dataset_dir)
   output_dir = Path(output_dir)
-  images = _iter_image_files(dataset_dir, splits=splits)
+  debug_viz_dir = Path(debug_viz_dir)
 
+  images: list[tuple[Path, Path]] = []
+
+  primary_images = _iter_image_files(dataset_dir, splits=splits)
+  for image_path in primary_images:
+    rel_path = image_path.relative_to(dataset_dir)
+    images.append((image_path, rel_path))
+
+  secondary_counts = None
+  if include_secondary:
+    secondary_dir = Path(secondary_dir)
+    if not secondary_dir.exists():
+      print(f"Secondary dataset directory {secondary_dir} not found; skipping.")
+    else:
+      secondary_images, secondary_counts = _prepare_secondary_images(
+          secondary_dir,
+          valid_frac=secondary_valid_frac,
+          test_frac=secondary_test_frac,
+          seed=secondary_seed,
+      )
+      images.extend(secondary_images)
+      print(
+          f"Added secondary dataset with splits: "
+          f"{secondary_counts['train']} train / {secondary_counts['valid']} valid / {secondary_counts['test']} test images"
+      )
+
+  total_images = len(images)
   if limit is not None:
     images = images[:limit]
+    if limit < total_images:
+      print(f"Limit set to {limit}; processing first {len(images)} of {total_images} combined images.")
 
   failures = []
-  debug_viz_dir = Path(debug_viz_dir)
   with create_landmarker(
       min_detection_confidence=min_detection_confidence,
       min_presence_confidence=DEFAULT_MIN_HAND_PRESENCE_CONFIDENCE
   ) as landmarker:
-    for idx, image_path in enumerate(images, start=1):
-      rel_path = image_path.relative_to(dataset_dir)
+    for idx, (image_path, rel_path) in enumerate(images, start=1):
       out_path = (output_dir / rel_path).with_suffix(".npy")
       debug_path = (debug_viz_dir / rel_path)
       try:
@@ -457,6 +553,16 @@ if __name__ == "__main__":
   parser.add_argument("--splits", nargs="+", help="Optional list of dataset splits to process (e.g. train valid test).")
   parser.add_argument("--dataset-stats", action="store_true",
                       help="Print image counts per split and chord for the dataset directory.")
+  parser.add_argument("--include-secondary", action="store_true",
+                      help="Also process ./data/secondary_data by auto-splitting it into train/valid/test.")
+  parser.add_argument("--secondary-dir", type=Path, default=DEFAULT_SECONDARY_DATASET_DIR,
+                      help="Root directory for the raw secondary dataset.")
+  parser.add_argument("--secondary-valid-frac", type=float, default=SECONDARY_DEFAULT_SPLITS[1],
+                      help="Validation fraction for the auto-split of the secondary dataset (default 0.1).")
+  parser.add_argument("--secondary-test-frac", type=float, default=SECONDARY_DEFAULT_SPLITS[2],
+                      help="Test fraction for the auto-split of the secondary dataset (default 0.1).")
+  parser.add_argument("--secondary-seed", type=int, default=SECONDARY_SPLIT_SEED,
+                      help="Random seed used when shuffling secondary data before splitting.")
   args = parser.parse_args()
 
   ran = False
@@ -482,7 +588,12 @@ if __name__ == "__main__":
                     min_detection_confidence=args.min_detection_confidence,
                     debug_viz_dir=args.debug_viz_dir,
                     limit=args.limit,
-                    splits=args.splits)
+                    splits=args.splits,
+                    include_secondary=args.include_secondary,
+                    secondary_dir=args.secondary_dir,
+                    secondary_valid_frac=args.secondary_valid_frac,
+                    secondary_test_frac=args.secondary_test_frac,
+                    secondary_seed=args.secondary_seed)
     ran = True
 
   if not ran:

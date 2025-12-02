@@ -15,6 +15,16 @@ def test_conv2d_init_shapes():
     assert params["b"].shape == (5,)
 
 
+def test_conv2d_kaiming_init_variance_matches_fan_in():
+    layer = Conv2D(in_channels=3, out_channels=4, kernel_size=(3, 3))
+    params = layer.init(jax.random.PRNGKey(0))
+    w = params["w"]
+    fan_in = 3 * 3 * 3
+    empirical_var = jnp.var(w)
+    expected_var = 2.0 / fan_in
+    assert jnp.isclose(empirical_var, expected_var, rtol=0.5)
+
+
 def test_conv2d_forward_valid_matches_manual_sum():
     layer = Conv2D(in_channels=1, out_channels=1, kernel_size=(2, 2), padding="VALID")
     params = {

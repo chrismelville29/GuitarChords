@@ -38,7 +38,10 @@ class BatchNorm(base.Layer):
         rng: PRNGKey | None = None,
         is_training: bool = True,
     ) -> Array:
-        _ = (rng, is_training)  # batch stats only; no running averages yet
+        # TEMP FIX: Always use batch statistics
+        # This works for training but causes issues with small validation batches
+        # TODO: Implement proper running statistics with mutable state
+        _ = rng
         if inputs.ndim != 4:
             raise ValueError("BatchNorm expects NHWC inputs with rank 4")
         if inputs.shape[-1] != self.num_features:
@@ -46,6 +49,7 @@ class BatchNorm(base.Layer):
                 f"Input channels ({inputs.shape[-1]}) must match num_features ({self.num_features})"
             )
 
+        # Use batch statistics (same for train and eval for now)
         mean = jnp.mean(inputs, axis=(0, 1, 2), keepdims=True)
         var = jnp.var(inputs, axis=(0, 1, 2), keepdims=True)
         normalized = (inputs - mean) / jnp.sqrt(var + self.epsilon)

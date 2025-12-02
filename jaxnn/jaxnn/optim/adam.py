@@ -8,17 +8,27 @@ import jax
 import jax.numpy as jnp
 
 from .base import Optimizer, scale_updates
+from .schedule import LRSchedule
 from .. import tree, types
 
 Params = types.Params
 OptState = types.OptState
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class AdamState:
     step: int
     m: Params
     v: Params
+
+    def tree_flatten(self):
+        return (self.step, self.m, self.v), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        step, m, v = children
+        return cls(step=step, m=m, v=v)
 
 
 @dataclass(frozen=True)
@@ -27,6 +37,7 @@ class Adam(Optimizer):
     beta1: float = 0.9
     beta2: float = 0.999
     eps: float = 1e-8
+    lr_schedule: LRSchedule | None = None
 
     def init(self, params: Params) -> AdamState:
         return AdamState(
@@ -42,6 +53,8 @@ class Adam(Optimizer):
         params: Params,   # unused, but required by interface
     ) -> tuple[Params, AdamState]:
 
+        lr = self.lr if self.lr_schedule is None else self.lr_schedule(state.step)
+        lr = jnp.asarray(lr, dtype=jnp.result_type(lr, 0.0))
         step = state.step + 1
 
         # Update biased first and second moments
@@ -70,7 +83,7 @@ class Adam(Optimizer):
 
         # Compute parameter updates
         updates = jax.tree_util.tree_map(
-            lambda m, v: -self.lr * m / (jnp.sqrt(v) + self.eps),
+            lambda m, v: -lr * m / (jnp.sqrt(v) + self.eps),
             m_hat,
             v_hat,
         )

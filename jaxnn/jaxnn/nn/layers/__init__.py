@@ -8,7 +8,9 @@ from .base import Layer
 from .batchnorm import BatchNorm
 from .conv2d import Conv2D
 from .dense import Dense
+from .dropout import Dropout
 from .flatten import Flatten
+from .maxpool2d import MaxPool2D
 from .sequential import Sequential
 
 __all__ = [
@@ -16,9 +18,11 @@ __all__ = [
     "Activation",
     "Dense",
     "BatchNorm",
+    "Dropout",
     "Flatten",
     "Sequential",
     "Conv2D",
+    "MaxPool2D",
     "make_mlp",
 ]
 
