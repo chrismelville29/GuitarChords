@@ -21,6 +21,7 @@ DEFAULT_SECONDARY_DATASET_DIR = Path("data/secondary_data")
 SECONDARY_DEFAULT_SPLITS = (0.8, 0.1, 0.1)  # train, valid, test
 SECONDARY_SPLIT_SEED = 1337
 DEFAULT_OUTPUT_DIR = Path("data/guitar-chords_landmarks")
+DEFAULT_ORIGINAL_OUTPUT_DIR = Path("data/guitar-chords_landmarks_original")
 DEFAULT_DEBUG_VIZ_DIR = Path("data/guitar-chords_debug_viz")
 MODEL_PATH = Path("./models/hand_landmarker.task")
 MIN_CONFIDENCE_FLOOR = 0.4
@@ -447,15 +448,22 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
                     secondary_dir: Path = DEFAULT_SECONDARY_DATASET_DIR,
                     secondary_valid_frac: float = SECONDARY_DEFAULT_SPLITS[1],
                     secondary_test_frac: float = SECONDARY_DEFAULT_SPLITS[2],
-                    secondary_seed: int = SECONDARY_SPLIT_SEED):
+                    secondary_seed: int = SECONDARY_SPLIT_SEED,
+                    keep_original: bool = False):
   """
-  Downloads (if necessary) and processes the dataset into 20-point wrist-normalized npy files.
+  Downloads (if necessary) and processes the dataset into 20-point wrist-normalized npy files by default,
+  or preserves the original 21-point coordinates when keep_original=True.
   Optionally also folds in the local ./data/secondary_data set by auto-splitting it into
   train/valid/test before processing.
   """
   dataset_dir = download_guitar_chords_dataset(dataset_dir)
   output_dir = Path(output_dir)
+  if keep_original and output_dir == DEFAULT_OUTPUT_DIR:
+    output_dir = DEFAULT_ORIGINAL_OUTPUT_DIR
   debug_viz_dir = Path(debug_viz_dir)
+
+  export_desc = "21-point original landmarks" if keep_original else "20-point wrist-normalized landmarks"
+  print(f"Exporting {export_desc} to {output_dir}")
 
   images: list[tuple[Path, Path]] = []
 
@@ -489,6 +497,8 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
       print(f"Limit set to {limit}; processing first {len(images)} of {total_images} combined images.")
 
   failures = []
+  skipped_missing = 0
+  saved_count = 0
   with create_landmarker(
       min_detection_confidence=min_detection_confidence,
       min_presence_confidence=DEFAULT_MIN_HAND_PRESENCE_CONFIDENCE
@@ -500,12 +510,19 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
         mp_image = mp.Image.create_from_file(str(image_path))
         world_landmarks, detection_result = _detect_world_landmarks(mp_image, landmarker)
         if world_landmarks is None:
+          if keep_original:
+            skipped_missing += 1
+            for stale_path in (out_path, debug_path):
+              if stale_path.exists():
+                stale_path.unlink()
+            continue
           raise Exception("no hands found")
 
-        normalized_landmarks = normalize_to_wrist(world_landmarks)
+        exported_landmarks = world_landmarks if keep_original else normalize_to_wrist(world_landmarks)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(out_path, normalized_landmarks.astype(np.float32))
+        np.save(out_path, exported_landmarks.astype(np.float32))
+        saved_count += 1
 
         # Save debug visualization with landmarks drawn
         annotated_image = draw_landmarks_on_image(mp_image.numpy_view(), detection_result)
@@ -520,7 +537,9 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
           if stale_path.exists():
             stale_path.unlink()
 
-  print(f"Finished processing {len(images)} images with {len(failures)} failures.")
+  print(f"Finished processing {len(images)} images with {len(failures)} failures; saved {saved_count} samples.")
+  if skipped_missing:
+    print(f"Skipped {skipped_missing} images without detections (original-export mode).")
   if failures:
     print("Failed files:")
     for path, msg in failures[:10]:
@@ -528,7 +547,10 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
     if len(failures) > 10:
       print(f"  ... {len(failures) - 10} more")
 
-  return {"processed": len(images) - len(failures), "failed": failures}
+  result = {"processed": saved_count, "failed": failures}
+  if skipped_missing:
+    result["skipped"] = skipped_missing
+  return result
 
 
 if __name__ == "__main__":
@@ -538,6 +560,8 @@ if __name__ == "__main__":
   parser.add_argument("--image", help="Path to a single image to convert to wrist-normalized npy.")
   parser.add_argument("--output", help="Output path for the npy file when using --image.")
   parser.add_argument("--show", action="store_true", help="Show detection overlay for single image processing.")
+  parser.add_argument("--original", action="store_true",
+                      help="Keep the original 21-point landmark output instead of wrist-normalized 20-point data.")
   parser.add_argument("--process-dataset", action="store_true",
                       help="Automatically download dduka/guitar-chords and export wrist-normalized npy files.")
   parser.add_argument("--dataset-dir", type=Path, default=DEFAULT_DATASET_DIR,
@@ -566,16 +590,20 @@ if __name__ == "__main__":
   args = parser.parse_args()
 
   ran = False
+  dataset_output_dir = args.output_dir
+  if args.original and dataset_output_dir == DEFAULT_OUTPUT_DIR:
+    dataset_output_dir = DEFAULT_ORIGINAL_OUTPUT_DIR
 
   if args.image:
     world_landmarks = get_landmarks(args.image,
                                     min_detection_confidence=args.min_detection_confidence,
                                     show_marks=args.show)
-    normalized_landmarks = normalize_to_wrist(world_landmarks)
+    exported_landmarks = world_landmarks if args.original else normalize_to_wrist(world_landmarks)
     output_path = Path(args.output) if args.output else Path(args.image).with_suffix(".npy")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(output_path, normalized_landmarks.astype(np.float32))
-    print(f"Saved 20-point wrist-normalized landmarks to {output_path}")
+    np.save(output_path, exported_landmarks.astype(np.float32))
+    descriptor = "21-point original landmarks" if args.original else "20-point wrist-normalized landmarks"
+    print(f"Saved {descriptor} to {output_path}")
     ran = True
 
   if args.dataset_stats:
@@ -584,7 +612,7 @@ if __name__ == "__main__":
 
   if args.process_dataset:
     process_dataset(dataset_dir=args.dataset_dir,
-                    output_dir=args.output_dir,
+                    output_dir=dataset_output_dir,
                     min_detection_confidence=args.min_detection_confidence,
                     debug_viz_dir=args.debug_viz_dir,
                     limit=args.limit,
@@ -593,7 +621,8 @@ if __name__ == "__main__":
                     secondary_dir=args.secondary_dir,
                     secondary_valid_frac=args.secondary_valid_frac,
                     secondary_test_frac=args.secondary_test_frac,
-                    secondary_seed=args.secondary_seed)
+                    secondary_seed=args.secondary_seed,
+                    keep_original=args.original)
     ran = True
 
   if not ran:
