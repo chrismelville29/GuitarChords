@@ -11,10 +11,6 @@ the same per-epoch count and (b) applying class-weighted cross-entropy.
 
 from __future__ import annotations
 
-import os
-# Force JAX to use CPU only to avoid CUDA plugin conflicts
-os.environ['JAX_PLATFORMS'] = 'cpu'
-
 import argparse
 import math
 from collections import Counter, defaultdict
@@ -220,16 +216,19 @@ class ResidualBlock(layer_base.Layer):
     in_channels: int
     out_channels: int
     strides: tuple[int, int] = (1, 1)
+    use_lax_conv: bool = False
 
     def __post_init__(self) -> None:
         if len(self.strides) != 2:
             raise ValueError("strides must be a 2-tuple")
+        if not isinstance(self.use_lax_conv, bool):
+            raise ValueError("use_lax_conv must be a bool")
 
     def init(self, rng: PRNGKey) -> Params:
         k1, k2, kproj = jax.random.split(rng, 3)
 
-        conv1 = layers.Conv2D(self.in_channels, self.out_channels, (3, 3), strides=self.strides)
-        conv2 = layers.Conv2D(self.out_channels, self.out_channels, (3, 3), strides=(1, 1))
+        conv1 = layers.Conv2D(self.in_channels, self.out_channels, (3, 3), strides=self.strides, use_lax=self.use_lax_conv)
+        conv2 = layers.Conv2D(self.out_channels, self.out_channels, (3, 3), strides=(1, 1), use_lax=self.use_lax_conv)
 
         params = {
             "conv1": conv1.init(k1),
@@ -237,7 +236,7 @@ class ResidualBlock(layer_base.Layer):
         }
 
         if self.in_channels != self.out_channels or self.strides != (1, 1):
-            proj = layers.Conv2D(self.in_channels, self.out_channels, (1, 1), strides=self.strides)
+            proj = layers.Conv2D(self.in_channels, self.out_channels, (1, 1), strides=self.strides, use_lax=self.use_lax_conv)
             params["proj"] = proj.init(kproj)
 
         return params
@@ -268,7 +267,7 @@ class ResidualBlock(layer_base.Layer):
         return activations.leaky_relu(out + shortcut)
 
 
-def build_model(num_classes: int) -> layers.Sequential:
+def build_model(num_classes: int, *, use_lax_conv: bool = False) -> layers.Sequential:
     """Construct a balanced classifier for 4x5x3 inputs.
 
     Uses multiple conv layers with increasing channels and strategic dropout
@@ -278,17 +277,24 @@ def build_model(num_classes: int) -> layers.Sequential:
     return layers.Sequential(
         (
             # Conv block 1
-            layers.Conv2D(in_channels=3, out_channels=32, kernel_size=(3, 3), padding="SAME"),
+            layers.Conv2D(in_channels=3, out_channels=32, kernel_size=(3, 3), padding="SAME", use_lax=use_lax_conv),
             layers.Activation("leaky_relu"),
             layers.Dropout(rate=0.2),
 
             # Conv block 2
-            layers.Conv2D(in_channels=32, out_channels=64, kernel_size=(3, 3), padding="SAME"),
+            layers.Conv2D(in_channels=32, out_channels=64, kernel_size=(3, 3), padding="SAME", use_lax=use_lax_conv),
             layers.Activation("leaky_relu"),
             layers.Dropout(rate=0.2),
 
             # Conv block 3 with downsampling
-            layers.Conv2D(in_channels=64, out_channels=128, kernel_size=(3, 3), strides=(2, 2), padding="SAME"),
+            layers.Conv2D(
+                in_channels=64,
+                out_channels=128,
+                kernel_size=(3, 3),
+                strides=(2, 2),
+                padding="SAME",
+                use_lax=use_lax_conv,
+            ),
             layers.Activation("leaky_relu"),
             layers.Dropout(rate=0.3),
 
@@ -321,6 +327,7 @@ def l2_regularization(params: Params, weight_decay: float = 1e-4) -> Array:
 
 
 def make_train_step(network: layers.Sequential, optimizer: Adam, weight_decay: float = 1e-4):
+    @jax.jit
     def train_step(state: optim_base.TrainState, batch: dict[str, Array], rng: PRNGKey) -> tuple[optim_base.TrainState, Array]:
         def loss_fn(params: Params) -> Array:
             logits = network.apply(params, batch["x"], rng=rng, is_training=True)
@@ -362,6 +369,7 @@ def run_training(
     class_weight_beta: float = 0.99,
     restrict_to_valid_classes: bool = False,
     augment: bool = True,
+    fast_training: bool = False,
 ) -> None:
     train_dir = data_root / "train"
     valid_dir = data_root / "valid"
@@ -423,7 +431,7 @@ def run_training(
     print(f"\nClass weighting mode: {class_weighting} (beta={class_weight_beta if class_weighting == 'effective' else 'n/a'})")
     print(f"Weights: {np.round(class_weights, 3).tolist()}")
 
-    network = build_model(num_classes=len(class_names))
+    network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
     rng = jax.random.PRNGKey(seed)
     params = network.init(rng)
 
@@ -531,6 +539,11 @@ def main() -> None:
     parser.add_argument("--restrict-to-valid-classes", action="store_true",
                         help="Drop train-only classes so metrics reflect the validation label space.")
     parser.add_argument("--no-augment", action="store_true", help="Disable on-the-fly geometric noise during training.")
+    parser.add_argument(
+        "--fast-training",
+        action="store_true",
+        help="Use XLA-backed convolutions (lax.conv_general_dilated) for faster GPU/TPU execution.",
+    )
 
     args = parser.parse_args()
 
@@ -546,6 +559,7 @@ def main() -> None:
         class_weight_beta=args.class_weight_beta,
         restrict_to_valid_classes=args.restrict_to_valid_classes,
         augment=not args.no_augment,
+        fast_training=args.fast_training,
     )
 
 

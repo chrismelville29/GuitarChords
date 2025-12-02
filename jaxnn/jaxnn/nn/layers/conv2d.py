@@ -1,4 +1,4 @@
-"""2D convolution layer implemented from first principles (no ``lax.conv``)."""
+"""2D convolution layer with a manual path and an optional lax-backed fast path."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,6 +22,7 @@ class Conv2D(base.Layer):
     kernel_size: tuple[int, int]
     strides: tuple[int, int] = (1, 1)
     padding: str = "SAME"
+    use_lax: bool = False
 
     def __post_init__(self) -> None:
         if len(self.kernel_size) != 2:
@@ -34,6 +35,8 @@ class Conv2D(base.Layer):
             raise ValueError("stride entries must be positive")
         if self.in_channels <= 0 or self.out_channels <= 0:
             raise ValueError("in_channels and out_channels must be positive")
+        if not isinstance(self.use_lax, bool):
+            raise TypeError("use_lax must be a bool")
 
     def _conv_kernel_init(self, rng: PRNGKey) -> Array:
         """Default Kaiming/MSRA init scaled by receptive field size."""
@@ -123,6 +126,20 @@ class Conv2D(base.Layer):
             raise ValueError(
                 f"Input channels ({inputs.shape[-1]}) must match in_channels ({self.in_channels})"
             )
+
+        if self.use_lax:
+            # Leverage XLA/accelerator convolution when available for speed.
+            pad_type = self.padding.upper()
+            if pad_type not in {"SAME", "VALID"}:
+                raise ValueError("padding must be 'SAME' or 'VALID'")
+            out = jax.lax.conv_general_dilated(
+                inputs,
+                params["w"],
+                window_strides=self.strides,
+                padding=pad_type,
+                dimension_numbers=("NHWC", "HWIO", "NHWC"),
+            )
+            return out + params["b"]
 
         # Vectorize over batch dimension.
         return jax.vmap(lambda img: self._convolve_single_image(params, img))(inputs)
