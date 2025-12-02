@@ -11,6 +11,12 @@ from .dense import Dense
 from .dropout import Dropout
 from .flatten import Flatten
 from .maxpool2d import MaxPool2D
+from .layernorm import LayerNorm
+from .graph_transformer import (
+    GraphMultiHeadAttention,
+    GraphTransformerLayer,
+    GraphAttentionTransformerLayer,
+)
 from .sequential import Sequential
 
 __all__ = [
@@ -20,9 +26,13 @@ __all__ = [
     "BatchNorm",
     "Dropout",
     "Flatten",
+    "LayerNorm",
     "Sequential",
     "Conv2D",
     "MaxPool2D",
+    "GraphMultiHeadAttention",
+    "GraphTransformerLayer",
+    "GraphAttentionTransformerLayer",
     "make_mlp",
 ]
 
