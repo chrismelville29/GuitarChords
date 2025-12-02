@@ -19,12 +19,13 @@ DEFAULT_DATASET_DIR = Path("data/guitar-chords")
 DEFAULT_OUTPUT_DIR = Path("data/guitar-chords_landmarks")
 DEFAULT_DEBUG_VIZ_DIR = Path("data/guitar-chords_debug_viz")
 MODEL_PATH = Path("./models/hand_landmarker.task")
+MIN_CONFIDENCE_FLOOR = 0.4
 DEFAULT_MIN_HAND_DETECTION_CONFIDENCE = 0.5
 DEFAULT_MIN_HAND_PRESENCE_CONFIDENCE = 0.5
-FALLBACK_MIN_HAND_DETECTION_CONFIDENCE = 0.3
-FALLBACK_MIN_HAND_PRESENCE_CONFIDENCE = 0.3
-FINAL_FALLBACK_DETECTION_CONFIDENCE = 0.1
-FINAL_FALLBACK_PRESENCE_CONFIDENCE = 0.1
+FALLBACK_MIN_HAND_DETECTION_CONFIDENCE = MIN_CONFIDENCE_FLOOR
+FALLBACK_MIN_HAND_PRESENCE_CONFIDENCE = MIN_CONFIDENCE_FLOOR
+FINAL_FALLBACK_DETECTION_CONFIDENCE = MIN_CONFIDENCE_FLOOR
+FINAL_FALLBACK_PRESENCE_CONFIDENCE = MIN_CONFIDENCE_FLOOR
 
 def draw_landmarks_on_image(rgb_image, detection_result):
   hand_landmarks_list = detection_result.hand_landmarks
@@ -66,6 +67,12 @@ def draw_landmarks_on_image(rgb_image, detection_result):
 
   return annotated_image
 
+def _clamp_confidence(value: float) -> float:
+  """
+  Enforces the minimum confidence floor to avoid overly-permissive detections.
+  """
+  return max(value, MIN_CONFIDENCE_FLOOR)
+
 
 def create_landmarker(min_detection_confidence: float = DEFAULT_MIN_HAND_DETECTION_CONFIDENCE,
                       min_presence_confidence: float = DEFAULT_MIN_HAND_PRESENCE_CONFIDENCE,
@@ -82,8 +89,8 @@ def create_landmarker(min_detection_confidence: float = DEFAULT_MIN_HAND_DETECTI
       base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
       running_mode=VisionRunningMode.IMAGE,
       num_hands=num_hands,
-      min_hand_detection_confidence=min_detection_confidence,
-      min_hand_presence_confidence=min_presence_confidence)
+      min_hand_detection_confidence=_clamp_confidence(min_detection_confidence),
+      min_hand_presence_confidence=_clamp_confidence(min_presence_confidence))
   return HandLandmarker.create_from_options(options)
 
 
@@ -139,8 +146,8 @@ def _detect_world_landmarks(mp_image: mp.Image,
   """
   Runs detection with multi-stage fallback strategy:
   1. Try with original settings
-  2. Retry with lower confidence thresholds
-  3. Apply image preprocessing and retry with lowest confidence
+  2. Retry with clamped fallback confidence (never below 0.4)
+  3. Apply image preprocessing and retry with the same clamped confidence
   Returns (world_landmarks or None, detection_result_used).
   """
   # First attempt with original settings
@@ -152,24 +159,27 @@ def _detect_world_landmarks(mp_image: mp.Image,
   if fallback_confidence is None:
     return world, result
 
+  fallback_confidence = _clamp_confidence(fallback_confidence)
+  fallback_presence_confidence = _clamp_confidence(FALLBACK_MIN_HAND_PRESENCE_CONFIDENCE)
+
   # Second attempt with fallback confidence
   with create_landmarker(
       min_detection_confidence=fallback_confidence,
-      min_presence_confidence=FALLBACK_MIN_HAND_PRESENCE_CONFIDENCE
+      min_presence_confidence=fallback_presence_confidence
   ) as fallback_landmarker:
     fallback_result = fallback_landmarker.detect(mp_image)
     world_fallback = _extract_world_landmarks(fallback_result)
     if world_fallback is not None:
       return world_fallback, fallback_result
 
-  # Third attempt with image preprocessing and very low confidence
+  # Third attempt with image preprocessing and the clamped confidence
   if use_preprocessing:
     enhanced_image = _preprocess_image(mp_image.numpy_view())
     mp_enhanced = mp.Image(image_format=mp.ImageFormat.SRGB, data=enhanced_image)
 
     with create_landmarker(
-        min_detection_confidence=FINAL_FALLBACK_DETECTION_CONFIDENCE,
-        min_presence_confidence=FINAL_FALLBACK_PRESENCE_CONFIDENCE
+        min_detection_confidence=_clamp_confidence(FINAL_FALLBACK_DETECTION_CONFIDENCE),
+        min_presence_confidence=_clamp_confidence(FINAL_FALLBACK_PRESENCE_CONFIDENCE)
     ) as final_landmarker:
       final_result = final_landmarker.detect(mp_enhanced)
       world_final = _extract_world_landmarks(final_result)
@@ -313,6 +323,56 @@ def _iter_image_files(root: Path, splits: Optional[Iterable[str]] = None) -> lis
       image_files.extend(sorted(search_dir.rglob("*.jpg")))
   return sorted(image_files)
 
+def _count_images_in_dir(directory: Path) -> int:
+  return sum(1 for _ in directory.glob("*.jpg"))
+
+
+def dataset_split_stats(dataset_dir: Path = DEFAULT_DATASET_DIR,
+                        splits: Optional[Iterable[str]] = None) -> dict[str, dict[str, int]]:
+  """
+  Returns nested counts: {split: {chord: num_images}}.
+  """
+  dataset_dir = Path(dataset_dir)
+  split_names = list(splits) if splits else sorted([p.name for p in dataset_dir.iterdir() if p.is_dir()])
+
+  stats: dict[str, dict[str, int]] = {}
+  for split in split_names:
+    split_dir = dataset_dir / split
+    if not split_dir.exists():
+      continue
+    chord_counts: dict[str, int] = {}
+    for chord_dir in sorted([p for p in split_dir.iterdir() if p.is_dir()]):
+      chord_counts[chord_dir.name] = _count_images_in_dir(chord_dir)
+    stats[split] = chord_counts
+  return stats
+
+
+def print_dataset_stats(dataset_dir: Path = DEFAULT_DATASET_DIR,
+                        splits: Optional[Iterable[str]] = None):
+  dataset_dir = download_guitar_chords_dataset(dataset_dir)
+  stats = dataset_split_stats(dataset_dir, splits=splits)
+  if not stats:
+    print(f"No splits found under {dataset_dir}")
+    return
+
+  total_images = 0
+  chord_totals: dict[str, int] = {}
+
+  for split, chord_counts in stats.items():
+    split_total = sum(chord_counts.values())
+    total_images += split_total
+    print(f"{split}: {split_total} images")
+    for chord, count in sorted(chord_counts.items()):
+      print(f"  {chord}: {count}")
+      chord_totals[chord] = chord_totals.get(chord, 0) + count
+
+  if chord_totals:
+    print("Overall by chord:")
+    for chord, count in sorted(chord_totals.items()):
+      print(f"  {chord}: {count}")
+
+  print(f"Grand total: {total_images} images")
+
 
 def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
                     output_dir: Path = DEFAULT_OUTPUT_DIR,
@@ -337,6 +397,9 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
       min_presence_confidence=DEFAULT_MIN_HAND_PRESENCE_CONFIDENCE
   ) as landmarker:
     for idx, image_path in enumerate(images, start=1):
+      rel_path = image_path.relative_to(dataset_dir)
+      out_path = (output_dir / rel_path).with_suffix(".npy")
+      debug_path = (debug_viz_dir / rel_path)
       try:
         mp_image = mp.Image.create_from_file(str(image_path))
         world_landmarks, detection_result = _detect_world_landmarks(mp_image, landmarker)
@@ -345,14 +408,11 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
 
         normalized_landmarks = normalize_to_wrist(world_landmarks)
 
-        rel_path = image_path.relative_to(dataset_dir)
-        out_path = (output_dir / rel_path).with_suffix(".npy")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(out_path, normalized_landmarks.astype(np.float32))
 
         # Save debug visualization with landmarks drawn
         annotated_image = draw_landmarks_on_image(mp_image.numpy_view(), detection_result)
-        debug_path = (debug_viz_dir / rel_path)
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(debug_path), cv2.cvtColor(annotated_image, cv2.COLOR_RGB2BGR))
 
@@ -360,6 +420,9 @@ def process_dataset(dataset_dir: Path = DEFAULT_DATASET_DIR,
           print(f"Processed {idx} / {len(images)} images")
       except Exception as exc:
         failures.append((str(image_path), str(exc)))
+        for stale_path in (out_path, debug_path):
+          if stale_path.exists():
+            stale_path.unlink()
 
   print(f"Finished processing {len(images)} images with {len(failures)} failures.")
   if failures:
@@ -392,6 +455,8 @@ if __name__ == "__main__":
                       help="Minimum confidence threshold for hand detection.")
   parser.add_argument("--limit", type=int, help="Limit number of images when processing the dataset.")
   parser.add_argument("--splits", nargs="+", help="Optional list of dataset splits to process (e.g. train valid test).")
+  parser.add_argument("--dataset-stats", action="store_true",
+                      help="Print image counts per split and chord for the dataset directory.")
   args = parser.parse_args()
 
   ran = False
@@ -405,6 +470,10 @@ if __name__ == "__main__":
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(output_path, normalized_landmarks.astype(np.float32))
     print(f"Saved 20-point wrist-normalized landmarks to {output_path}")
+    ran = True
+
+  if args.dataset_stats:
+    print_dataset_stats(dataset_dir=args.dataset_dir, splits=args.splits)
     ran = True
 
   if args.process_dataset:
