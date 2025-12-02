@@ -4,3 +4,4 @@ venv
 jaxnn/build
 jaxnn/jaxnn.egg-info
 __pycache__
+runs

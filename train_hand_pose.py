@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,10 +31,87 @@ from jaxnn.nn.layers import base as layer_base
 from jaxnn.optim import base as optim_base
 from jaxnn.optim.adam import Adam
 
+try:  # Prefer PyTorch's writer when available.
+    from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
+except ImportError:  # pragma: no cover - optional dependency
+    TorchSummaryWriter = None  # type: ignore
+
+try:
+    from tensorboardX import SummaryWriter as TensorboardXSummaryWriter
+except ImportError:  # pragma: no cover - optional dependency
+    TensorboardXSummaryWriter = None  # type: ignore
+
+try:
+    from tensorboard.summary.writer.event_file_writer import EventFileWriter as TensorBoardEventFileWriter
+    from tensorboard.compat.proto import event_pb2, summary_pb2
+except ImportError:  # pragma: no cover - optional dependency
+    TensorBoardEventFileWriter = None  # type: ignore
+    event_pb2 = summary_pb2 = None  # type: ignore
+
 
 Array = types.Array
 Params = types.Params
 PRNGKey = types.PRNGKey
+
+
+class _EventFileSummaryWriter:
+    """Fallback writer that directly emits TensorBoard event files."""
+
+    def __init__(self, log_dir: Path):
+        if TensorBoardEventFileWriter is None or event_pb2 is None or summary_pb2 is None:
+            raise RuntimeError("TensorBoard event writer backend is unavailable.")
+        self._writer = TensorBoardEventFileWriter(str(log_dir))
+
+    def add_scalar(self, tag: str, value: float, step: int) -> None:
+        event = event_pb2.Event(wall_time=time.time(), step=int(step))
+        event.summary.value.add(tag=tag, simple_value=float(value))
+        self._writer.add_event(event)
+
+    def flush(self) -> None:
+        self._writer.flush()
+
+    def close(self) -> None:
+        self._writer.close()
+
+
+def _create_summary_writer(log_dir: Path | None):
+    if log_dir is None:
+        raise RuntimeError(
+            "TensorBoard logging is mandatory; log_dir must be resolved before training."
+        )
+
+    resolved = log_dir.expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+
+    writer = None
+    if TorchSummaryWriter is not None:
+        writer = TorchSummaryWriter(log_dir=str(resolved))
+    elif TensorboardXSummaryWriter is not None:
+        writer = TensorboardXSummaryWriter(log_dir=str(resolved))
+    elif TensorBoardEventFileWriter is not None:
+        writer = _EventFileSummaryWriter(resolved)
+    if writer is None:
+        raise RuntimeError(
+            "TensorBoard logging requires `tensorboard`, `tensorboardX`, or `torch` to be installed."
+        )
+
+    print(f"Logging TensorBoard summaries to {resolved}")
+    print(f"Launch TensorBoard with: tensorboard --logdir {resolved}")
+    return writer
+
+
+def _resolve_log_dir(cli_value: Path | None) -> Path:
+    """Select the TensorBoard log directory with CLI > env > timestamp priority."""
+
+    if cli_value is not None:
+        return cli_value
+
+    env_override = os.environ.get("TENSORBOARD_LOGDIR")
+    if env_override:
+        return Path(env_override)
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return Path("runs") / timestamp
 
 
 # ----------------------------- Data utilities ----------------------------- #
@@ -370,6 +449,7 @@ def run_training(
     restrict_to_valid_classes: bool = False,
     augment: bool = True,
     fast_training: bool = False,
+    log_dir: Path | None = None,
 ) -> None:
     train_dir = data_root / "train"
     valid_dir = data_root / "valid"
@@ -445,6 +525,8 @@ def run_training(
     max_train_count = max(train_counts.values())
     epoch_size = max_train_count * len(class_names) if oversample else len(train_samples)
     steps = steps_per_epoch or max(1, math.ceil(epoch_size / batch_size))
+    summary_writer = _create_summary_writer(log_dir)
+    global_step = 0
 
     train_iter = batch_iterator(
         train_samples,
@@ -464,6 +546,9 @@ def run_training(
             step_rng = jax.random.fold_in(rng, epoch * steps + step_idx)
             state, loss_value = train_step(state, batch, step_rng)
             epoch_losses.append(float(loss_value))
+            if summary_writer is not None:
+                summary_writer.add_scalar("loss/train_batch", float(loss_value), global_step)
+            global_step += 1
 
         # Validation on the entire validation set (reset each epoch for consistency)
         if valid_samples:
@@ -515,12 +600,22 @@ def run_training(
             avg_val_loss = 0.0
             avg_val_acc = 0.0
 
+        train_epoch_loss = np.mean(epoch_losses)
+
         print(
-            f"Epoch {epoch:02d} | train_loss={np.mean(epoch_losses):.4f} "
+            f"Epoch {epoch:02d} | train_loss={train_epoch_loss:.4f} "
             f"val_loss={avg_val_loss:.4f} val_acc={avg_val_acc:.4f}"
         )
 
+        if summary_writer is not None:
+            summary_writer.add_scalar("loss/train_epoch", float(train_epoch_loss), epoch)
+            summary_writer.add_scalar("loss/val", float(avg_val_loss), epoch)
+            summary_writer.add_scalar("accuracy/val", float(avg_val_acc), epoch)
+            summary_writer.flush()
+
     print("Training complete. You can now use `network.apply` with the learned params.")
+    if summary_writer is not None:
+        summary_writer.close()
 
 
 def main() -> None:
@@ -544,8 +639,17 @@ def main() -> None:
         action="store_true",
         help="Use XLA-backed convolutions (lax.conv_general_dilated) for faster GPU/TPU execution.",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        help=(
+            "Directory for TensorBoard event files. Defaults to TENSORBOARD_LOGDIR or runs/<timestamp> "
+            "when not provided."
+        ),
+    )
 
     args = parser.parse_args()
+    resolved_log_dir = _resolve_log_dir(args.log_dir)
 
     run_training(
         data_root=args.data_root,
@@ -560,6 +664,7 @@ def main() -> None:
         restrict_to_valid_classes=args.restrict_to_valid_classes,
         augment=not args.no_augment,
         fast_training=args.fast_training,
+        log_dir=resolved_log_dir,
     )
 
 
