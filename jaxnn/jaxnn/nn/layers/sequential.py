@@ -35,7 +35,8 @@ class Sequential(base.Layer):
         *,
         rng: PRNGKey | None = None,
         is_training: bool = True,
-    ) -> Array:
+        return_updated_params: bool = False,
+    ) -> Array | tuple[Array, Params]:
         if not isinstance(params, (list, tuple)):
             raise TypeError("Sequential params must be a sequence aligned with sub-layers")
         if len(params) != len(self.layers):
@@ -44,10 +45,26 @@ class Sequential(base.Layer):
         rngs = None
         if rng is not None and self.split_rngs:
             rngs = jax.random.split(rng, len(self.layers))
+
         outputs = inputs
+        updated_params_list = []
+        any_updates = False
+
         for idx, (layer, layer_params) in enumerate(zip(self.layers, params)):
             layer_rng = rngs[idx] if rngs is not None else None
-            outputs = layer.apply(layer_params, outputs, rng=layer_rng, is_training=is_training)
+            out = layer.apply(layer_params, outputs, rng=layer_rng, is_training=is_training)
+
+            if isinstance(out, tuple):
+                outputs, layer_params_updated = out
+                any_updates = True
+            else:
+                outputs = out
+                layer_params_updated = layer_params
+
+            updated_params_list.append(layer_params_updated)
+
+        if return_updated_params or any_updates:
+            return outputs, tuple(updated_params_list)
         return outputs
 
 
