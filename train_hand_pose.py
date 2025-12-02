@@ -31,6 +31,7 @@ from jaxnn.nn import layers
 from jaxnn.nn.layers import base as layer_base
 from jaxnn.optim import base as optim_base
 from jaxnn.optim.adam import Adam
+from jaxnn.optim.schedule import cosine_decay_schedule
 
 try:  # Prefer PyTorch's writer when available.
     from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
@@ -550,6 +551,10 @@ def run_training(
     learning_rate: float,
     model_type: str = "baseline",
     resnet_width_mult: float = 1.0,
+    lr_schedule: str = "constant",
+    min_learning_rate: float = 1e-5,
+    use_swa: bool = False,
+    swa_start_epoch: int = 10,
     seed: int = 0,
     steps_per_epoch: int | None = None,
     *,
@@ -561,6 +566,11 @@ def run_training(
     fast_training: bool = False,
     log_dir: Path | None = None,
 ) -> None:
+    if swa_start_epoch < 0:
+        raise ValueError("swa_start_epoch must be non-negative")
+    if min_learning_rate < 0:
+        raise ValueError("min_learning_rate must be non-negative")
+
     train_dir = data_root / "train"
     valid_dir = data_root / "valid"
 
@@ -620,6 +630,15 @@ def run_training(
 
     print(f"\nClass weighting mode: {class_weighting} (beta={class_weight_beta if class_weighting == 'effective' else 'n/a'})")
     print(f"Weights: {np.round(class_weights, 3).tolist()}")
+    print(f"LR schedule: {lr_schedule} (min_lr={min_learning_rate})")
+    if use_swa:
+        print(f"SWA: enabled (start_epoch={swa_start_epoch}, waits for best-val epoch).")
+    else:
+        print("SWA: disabled.")
+
+    max_train_count = max(train_counts.values())
+    epoch_size = max_train_count * len(class_names) if oversample else len(train_samples)
+    steps = steps_per_epoch or max(1, math.ceil(epoch_size / batch_size))
 
     if model_type == "baseline":
         network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
@@ -638,18 +657,33 @@ def run_training(
     rng = jax.random.PRNGKey(seed)
     params = network.init(rng)
 
-    optimizer = Adam(lr=learning_rate)
+    if lr_schedule == "constant":
+        lr_sched_fn = None
+    elif lr_schedule == "cosine":
+        total_steps = epochs * steps
+        lr_sched_fn = cosine_decay_schedule(initial_lr=learning_rate, final_lr=min_learning_rate, total_steps=total_steps)
+    else:
+        raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
+
+    # Helper to log LR even when optimizer schedule is None (constant).
+    def _current_lr(step: int) -> float:
+        if lr_sched_fn is None:
+            return float(learning_rate)
+        return float(lr_sched_fn(step))
+
+    optimizer = Adam(lr=learning_rate, lr_schedule=lr_sched_fn)
     opt_state = optimizer.init(params)
     state = optim_base.TrainState(params, opt_state)
 
     train_step = make_train_step(network, optimizer, weight_decay=1e-4)  # Moderate L2 regularization
     eval_step = make_eval_step(network)
 
-    max_train_count = max(train_counts.values())
-    epoch_size = max_train_count * len(class_names) if oversample else len(train_samples)
-    steps = steps_per_epoch or max(1, math.ceil(epoch_size / batch_size))
     summary_writer = _create_summary_writer(log_dir)
     global_step = 0
+    best_val_acc = -np.inf
+    best_epoch = 0
+    swa_params: Params | None = None
+    swa_count = 0
 
     train_iter = batch_iterator(
         train_samples,
@@ -671,6 +705,7 @@ def run_training(
             epoch_losses.append(float(loss_value))
             if summary_writer is not None:
                 summary_writer.add_scalar("loss/train_batch", float(loss_value), global_step)
+                summary_writer.add_scalar("lr", _current_lr(state.opt_state.step), global_step)
             global_step += 1
 
         # Validation on the entire validation set (reset each epoch for consistency)
@@ -725,6 +760,23 @@ def run_training(
 
         train_epoch_loss = np.mean(epoch_losses)
 
+        if avg_val_acc > best_val_acc:
+            best_val_acc = avg_val_acc
+            best_epoch = epoch
+
+        # Stochastic Weight Averaging: start averaging from max(best_epoch, swa_start_epoch)
+        if use_swa and epoch >= max(best_epoch, swa_start_epoch):
+            if swa_params is None:
+                swa_params = state.params
+                swa_count = 1
+            else:
+                swa_params = jax.tree_util.tree_map(
+                    lambda a, b: (a * swa_count + b) / (swa_count + 1),
+                    swa_params,
+                    state.params,
+                )
+                swa_count += 1
+
         print(
             f"Epoch {epoch:02d} | train_loss={train_epoch_loss:.4f} "
             f"val_loss={avg_val_loss:.4f} val_acc={avg_val_acc:.4f}"
@@ -735,6 +787,13 @@ def run_training(
             summary_writer.add_scalar("loss/val", float(avg_val_loss), epoch)
             summary_writer.add_scalar("accuracy/val", float(avg_val_acc), epoch)
             summary_writer.flush()
+
+    # Optionally swap to SWA-averaged weights for final model use.
+    if use_swa and swa_params is not None:
+        state = optim_base.TrainState(swa_params, state.opt_state)
+        print(f"Using SWA parameters averaged over {swa_count} epochs starting at epoch {max(best_epoch, swa_start_epoch)}.")
+    else:
+        print("SWA disabled or not triggered; final params come from the last epoch.")
 
     print("Training complete. You can now use `network.apply` with the learned params.")
     if summary_writer is not None:
@@ -747,10 +806,18 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--lr-schedule", choices=["constant", "cosine"], default="cosine",
+                        help="Learning rate schedule (default constant).")
+    parser.add_argument("--min-learning-rate", type=float, default=1e-5,
+                        help="Final learning rate for cosine decay.")
     parser.add_argument("--model-type", choices=["baseline", "resnet"], default="baseline",
                         help="Choose between the original CNN ('baseline') and a deeper residual model ('resnet').")
     parser.add_argument("--resnet-width-mult", type=float, default=1.0,
                         help="Width multiplier for the ResNet channels (only used when --model-type=resnet).")
+    parser.add_argument("--use-swa", action="store_true",
+                        help="Enable Stochastic Weight Averaging starting after swa-start-epoch and the best val epoch.")
+    parser.add_argument("--swa-start-epoch", type=int, default=10,
+                        help="Earliest epoch to begin SWA averaging (also waits for best-val epoch).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps-per-epoch", type=int, help="Optional number of batches per epoch (defaults to dataset size / batch).")
     parser.add_argument("--class-weighting", choices=["effective", "inverse", "sqrt", "none"], default="effective",
@@ -785,6 +852,10 @@ def main() -> None:
         learning_rate=args.learning_rate,
         model_type=args.model_type,
         resnet_width_mult=args.resnet_width_mult,
+        lr_schedule=args.lr_schedule,
+        min_learning_rate=args.min_learning_rate,
+        use_swa=args.use_swa,
+        swa_start_epoch=args.swa_start_epoch,
         seed=args.seed,
         steps_per_epoch=args.steps_per_epoch,
         oversample=not args.no_oversample,
