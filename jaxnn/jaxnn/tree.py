@@ -34,3 +34,8 @@ def clip_by_global_norm(tree: PyTree, max_norm: float) -> PyTree:
     norm = tree_l2_norm(tree)
     scale = jnp.minimum(1.0, max_norm / (norm + 1e-12))
     return tree_util.tree_map(lambda x: x * scale, tree)
+
+
+def zeros_like(tree: PyTree) -> PyTree:
+    """Return a pytree of zeros matching the input structure."""
+    return tree_util.tree_map(jnp.zeros_like, tree)
