@@ -29,6 +29,7 @@ from jaxnn import types
 from jaxnn.nn import activations
 from jaxnn.nn import layers
 from jaxnn.nn.layers import base as layer_base
+from jaxnn.nn.layers.batchnorm import BatchNorm
 from jaxnn.optim import base as optim_base
 from jaxnn.optim.adam import Adam
 from jaxnn.optim.schedule import cosine_decay_schedule
@@ -119,7 +120,12 @@ def _resolve_log_dir(cli_value: Path | None) -> Path:
 # ----------------------------- Data utilities ----------------------------- #
 
 
-def _finger_grid(landmarks: np.ndarray, augment: bool = False, rng: np.random.Generator | None = None) -> np.ndarray:
+def _finger_grid(
+    landmarks: np.ndarray,
+    augment: bool = False,
+    rng: np.random.Generator | None = None,
+    norm_stats: tuple[np.ndarray, np.ndarray] | None = None,
+) -> np.ndarray:
     """Reshape 20x3 landmarks into (4, 5, 3): 4 joints per finger x 5 fingers.
 
     The MediaPipe landmark order (after dropping the wrist) is grouped by finger
@@ -161,8 +167,13 @@ def _finger_grid(landmarks: np.ndarray, augment: bool = False, rng: np.random.Ge
         joints_per_finger.append(landmarks[start : start + 4])
 
     # Stack fingers along the second axis: (4 joints, 5 fingers, 3 channels)
-    grid = np.stack(joints_per_finger, axis=1)
-    return grid.astype(np.float32)
+    grid = np.stack(joints_per_finger, axis=1).astype(np.float32)
+
+    if norm_stats is not None:
+        mean, std = norm_stats
+        grid = (grid - mean) / (std + 1e-6)
+
+    return grid
 
 
 def _collect_split(split_dir: Path, class_names: Sequence[str] | None = None) -> tuple[List[tuple[Path, int]], List[str]]:
@@ -200,6 +211,28 @@ def _compute_class_weights(counts: Counter) -> np.ndarray:
     weights = {cls: total / (num_classes * count) for cls, count in counts.items()}
     weights_arr = np.array([weights[i] for i in range(num_classes)], dtype=np.float32)
     return weights_arr / np.mean(weights_arr)
+
+
+def _compute_channel_mean_std(samples: Sequence[tuple[Path, int]]) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-channel (x,y,z) mean/std over all landmark points in samples."""
+
+    total_points = 0
+    sum_channels = np.zeros(3, dtype=np.float64)
+    sumsq_channels = np.zeros(3, dtype=np.float64)
+
+    for path, _ in samples:
+        arr = np.load(path)  # shape (20, 3)
+        sum_channels += arr.sum(axis=0)
+        sumsq_channels += np.square(arr).sum(axis=0)
+        total_points += arr.shape[0]
+
+    if total_points == 0:
+        raise ValueError("No samples available to compute normalization stats.")
+
+    mean = sum_channels / total_points
+    var = sumsq_channels / total_points - np.square(mean)
+    std = np.sqrt(np.maximum(var, 1e-8))
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 def _effective_num_class_weights(counts: Counter, beta: float = 0.99) -> np.ndarray:
@@ -248,6 +281,7 @@ def batch_iterator(
     oversample: bool = True,
     augment: bool = False,
     seed: int = 0,
+    norm_stats: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> Iterator[dict[str, np.ndarray]]:
     """Yield batches with inputs, labels, and per-example weights."""
 
@@ -276,7 +310,7 @@ def batch_iterator(
             ws = []
             for path, label in batch_paths:
                 arr = np.load(path)
-                xs.append(_finger_grid(arr, augment=augment, rng=rng))
+                xs.append(_finger_grid(arr, augment=augment, rng=rng, norm_stats=norm_stats))
                 ys.append(label)
                 ws.append(class_weights[label])
 
@@ -309,16 +343,22 @@ class ResidualBlock(layer_base.Layer):
         k1, k2, kproj = jax.random.split(rng, 3)
 
         conv1 = layers.Conv2D(self.in_channels, self.out_channels, (3, 3), strides=self.strides, use_lax=self.use_lax_conv)
+        bn1 = BatchNorm(self.out_channels)
         conv2 = layers.Conv2D(self.out_channels, self.out_channels, (3, 3), strides=(1, 1), use_lax=self.use_lax_conv)
+        bn2 = BatchNorm(self.out_channels)
 
         params = {
             "conv1": conv1.init(k1),
+            "bn1": bn1.init(k1),
             "conv2": conv2.init(k2),
+            "bn2": bn2.init(k2),
         }
 
         if self.in_channels != self.out_channels or self.strides != (1, 1):
             proj = layers.Conv2D(self.in_channels, self.out_channels, (1, 1), strides=self.strides, use_lax=self.use_lax_conv)
+            bn_proj = BatchNorm(self.out_channels)
             params["proj"] = proj.init(kproj)
+            params["bn_proj"] = bn_proj.init(kproj)
 
         return params
 
@@ -330,7 +370,7 @@ class ResidualBlock(layer_base.Layer):
         rng: PRNGKey | None = None,
         is_training: bool = True,
     ) -> Array:
-        _ = (rng, is_training)  # no stochastic layers inside
+        _ = (rng,)  # no stochastic layers inside
 
         conv1 = layers.Conv2D(
             self.in_channels,
@@ -340,6 +380,7 @@ class ResidualBlock(layer_base.Layer):
             use_lax=self.use_lax_conv,
             padding="SAME",
         )
+        bn1 = BatchNorm(self.out_channels)
         conv2 = layers.Conv2D(
             self.out_channels,
             self.out_channels,
@@ -348,11 +389,22 @@ class ResidualBlock(layer_base.Layer):
             use_lax=self.use_lax_conv,
             padding="SAME",
         )
+        bn2 = BatchNorm(self.out_channels)
 
         out = conv1.apply(params["conv1"], inputs)
+        bn1_out = bn1.apply(params["bn1"], out, is_training=is_training)
+        if isinstance(bn1_out, tuple):
+            out, bn1_params = bn1_out
+        else:
+            out, bn1_params = bn1_out, params["bn1"]
         out = activations.leaky_relu(out)
 
         out = conv2.apply(params["conv2"], out)
+        bn2_out = bn2.apply(params["bn2"], out, is_training=is_training)
+        if isinstance(bn2_out, tuple):
+            out, bn2_params = bn2_out
+        else:
+            out, bn2_params = bn2_out, params["bn2"]
 
         shortcut = inputs
         if "proj" in params:
@@ -364,9 +416,29 @@ class ResidualBlock(layer_base.Layer):
                 use_lax=self.use_lax_conv,
                 padding="SAME",
             )
+            bn_proj = BatchNorm(self.out_channels)
             shortcut = proj.apply(params["proj"], inputs)
+            bn_proj_out = bn_proj.apply(params["bn_proj"], shortcut, is_training=is_training)
+            if isinstance(bn_proj_out, tuple):
+                shortcut, bn_proj_params = bn_proj_out
+            else:
+                shortcut, bn_proj_params = bn_proj_out, params["bn_proj"]
 
-        return activations.leaky_relu(out + shortcut)
+        out = activations.leaky_relu(out + shortcut)
+
+        if not is_training:
+            return out
+
+        # Merge updated BN running stats back into the params dict for upstream handling.
+        updated_params = {
+            **params,
+            "bn1": bn1_params,
+            "bn2": bn2_params,
+        }
+        if "proj" in params:
+            updated_params["bn_proj"] = bn_proj_params
+
+        return out, updated_params
 
 
 @dataclass(frozen=True)
@@ -439,7 +511,7 @@ def build_resnet_model(
     *,
     use_lax_conv: bool = False,
     width_mult: float = 1.0,
-    dropout_rate: float = 0.3,
+    dropout_rate: float = 0.1,
 ) -> layers.Sequential:
     """Tiny ResNet-style classifier tailored to the 4x5 landmark grid.
 
@@ -502,31 +574,86 @@ def build_resnet_model(
 
 
 def weighted_cross_entropy(logits: Array, labels: Array, weights: Array) -> Array:
-    one_hot = jax.nn.one_hot(labels, logits.shape[-1])
+    num_classes = logits.shape[-1]
+    smooth_eps = 0.03
+    one_hot = jax.nn.one_hot(labels, num_classes)
+    smoothed = (1.0 - smooth_eps) * one_hot + smooth_eps / num_classes
     log_probs = jax.nn.log_softmax(logits)
-    per_example = -jnp.sum(one_hot * log_probs, axis=-1)
+    per_example = -jnp.sum(smoothed * log_probs, axis=-1)
     return jnp.mean(per_example * weights)
 
 
-def l2_regularization(params: Params, weight_decay: float = 1e-4) -> Array:
-    """Compute L2 regularization penalty on parameters."""
-    leaves = jax.tree_util.tree_leaves(params)
-    return weight_decay * sum(jnp.sum(jnp.square(p)) for p in leaves)
+def l2_regularization(params: Params, weight_decay: float = 1e-4, *, mask: Params | None = None) -> Array:
+    """Compute L2 regularization penalty on parameters.
+
+    If ``mask`` is provided, it must mirror ``params`` and contain boolean arrays
+    where ``True`` means "exclude this leaf from L2". This is used to skip
+    BatchNorm running statistics.
+    """
+
+    if mask is None:
+        leaves = jax.tree_util.tree_leaves(params)
+        return weight_decay * sum(jnp.sum(jnp.square(p)) for p in leaves)
+
+    def _masked_l2(p, m):
+        return jnp.sum(jnp.square(p) * jnp.where(m, 0.0, 1.0))
+
+    leaves = jax.tree_util.tree_leaves(jax.tree_util.tree_map(_masked_l2, params, mask))
+    return weight_decay * sum(leaves)
 
 
-def make_train_step(network: layers.Sequential, optimizer: Adam, weight_decay: float = 1e-4):
+def _running_stat_mask(params: Params) -> Params:
+    """Return a boolean pytree marking BatchNorm running stats to exclude from L2/optimizer.
+
+    Leaves corresponding to ``running_mean`` and ``running_var`` are ``True``;
+    everything else is ``False`` with matching shape.
+    """
+
+    def _mark(node):
+        if isinstance(node, dict):
+            marked = {}
+            for k, v in node.items():
+                if k in {"running_mean", "running_var"}:
+                    marked[k] = jnp.ones_like(v, dtype=bool)
+                else:
+                    marked[k] = _mark(v)
+            return marked
+        if isinstance(node, (list, tuple)):
+            return type(node)(_mark(v) for v in node)
+        return jnp.zeros_like(node, dtype=bool)
+
+    return _mark(params)
+
+
+def make_train_step(network: layers.Sequential, optimizer: Adam, weight_decay: float = 1e-4, *, stat_mask: Params | None = None):
     @jax.jit
     def train_step(state: optim_base.TrainState, batch: dict[str, Array], rng: PRNGKey) -> tuple[optim_base.TrainState, Array]:
-        def loss_fn(params: Params) -> Array:
-            logits = network.apply(params, batch["x"], rng=rng, is_training=True)
-            ce_loss = weighted_cross_entropy(logits, batch["y"], batch["w"])
-            l2_loss = l2_regularization(params, weight_decay)
-            return ce_loss + l2_loss
+        def loss_fn(params: Params):
+            out = network.apply(params, batch["x"], rng=rng, is_training=True)
+            if isinstance(out, tuple):
+                logits, updated_params = out
+            else:
+                logits, updated_params = out, params
 
-        loss_value, grads = jax.value_and_grad(loss_fn)(state.params)
+            ce_loss = weighted_cross_entropy(logits, batch["y"], batch["w"])
+            l2_loss = l2_regularization(params, weight_decay, mask=stat_mask)
+            return ce_loss + l2_loss, updated_params
+
+        (loss_value, updated_params), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
         updates, new_opt_state = optimizer.update(grads, state.opt_state, state.params)
         new_params = optim_base.apply_updates(state.params, updates)
-        new_state = optim_base.TrainState(new_params, new_opt_state)
+
+        if stat_mask is not None:
+            merged_params = jax.tree_util.tree_map(
+                lambda new_p, upd_p, mask: jnp.where(mask, upd_p, new_p),
+                new_params,
+                updated_params,
+                stat_mask,
+            )
+        else:
+            merged_params = new_params
+
+        new_state = optim_base.TrainState(merged_params, new_opt_state)
         return new_state, loss_value
 
     return train_step
@@ -594,6 +721,12 @@ def run_training(
 
     train_samples, class_names = _collect_split(train_dir, class_names=class_names)
     valid_samples, _ = _collect_split(valid_dir, class_names=class_names)
+
+    # Compute input normalization stats on the training set (channel-wise x/y/z).
+    channel_mean, channel_std = _compute_channel_mean_std(train_samples)
+    print(f"Input normalization (mean/std per channel):")
+    print(f"  mean: {np.round(channel_mean, 4)}")
+    print(f"  std : {np.round(channel_std, 4)}")
 
     # Track per-class availability and guard against missing labels.
     class_to_files: dict[int, list[Path]] = {idx: [] for idx in range(len(class_names))}
@@ -675,7 +808,8 @@ def run_training(
     opt_state = optimizer.init(params)
     state = optim_base.TrainState(params, opt_state)
 
-    train_step = make_train_step(network, optimizer, weight_decay=1e-4)  # Moderate L2 regularization
+    stat_mask = _running_stat_mask(params)
+    train_step = make_train_step(network, optimizer, weight_decay=1e-4, stat_mask=stat_mask)
     eval_step = make_eval_step(network)
 
     summary_writer = _create_summary_writer(log_dir)
@@ -692,6 +826,7 @@ def run_training(
         seed=seed,
         oversample=oversample,
         augment=augment,
+        norm_stats=(channel_mean, channel_std),
     )
 
     for epoch in range(1, epochs + 1):
@@ -712,7 +847,8 @@ def run_training(
         if valid_samples:
             all_preds = []
             all_labels = []
-            all_losses = []
+            loss_sum = 0.0
+            total_val_samples = 0
 
             # Process all validation samples in batches
             for start_idx in range(0, len(valid_samples), batch_size):
@@ -724,7 +860,7 @@ def run_training(
                 ws = []
                 for path, label in batch_samples:
                     arr = np.load(path)
-                    xs.append(_finger_grid(arr))
+                    xs.append(_finger_grid(arr, norm_stats=(channel_mean, channel_std)))
                     ys.append(label)
                     ws.append(class_weights[label])
 
@@ -741,10 +877,12 @@ def run_training(
                 preds = jnp.argmax(logits, axis=-1)
                 all_preds.extend(preds.tolist())
                 all_labels.extend(batch_y.tolist())
-                all_losses.append(float(metrics['loss']))
+                batch_size_eff = len(batch_samples)
+                loss_sum += float(metrics['loss']) * batch_size_eff
+                total_val_samples += batch_size_eff
 
             # Calculate overall metrics
-            avg_val_loss = np.mean(all_losses)
+            avg_val_loss = loss_sum / max(1, total_val_samples)
             avg_val_acc = np.mean(np.array(all_preds) == np.array(all_labels))
 
             # Debug: show prediction distribution every 10 epochs
