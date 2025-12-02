@@ -1,9 +1,10 @@
-"""Minimal hand-pose classifier training script using jaxnn.
+"""Hand-pose classifier training script using jaxnn.
 
 The model consumes wrist-normalized landmark .npy files produced by
 ``hand_pose.py``. Each file contains 20 (x, y, z) points (wrist removed).
 We reshape them into a 4x5 grid (joints x fingers) with 3 channels to feed a
-small ResNet-style CNN that uses leaky ReLU activations and Adam.
+small CNN or an optional tiny ResNet-style model that uses leaky ReLU
+activations and Adam.
 
 The script also balances uneven chord data by (a) oversampling each class to
 the same per-epoch count and (b) applying class-weighted cross-entropy.
@@ -330,8 +331,22 @@ class ResidualBlock(layer_base.Layer):
     ) -> Array:
         _ = (rng, is_training)  # no stochastic layers inside
 
-        conv1 = layers.Conv2D(self.in_channels, self.out_channels, (3, 3), strides=self.strides)
-        conv2 = layers.Conv2D(self.out_channels, self.out_channels, (3, 3), strides=(1, 1))
+        conv1 = layers.Conv2D(
+            self.in_channels,
+            self.out_channels,
+            (3, 3),
+            strides=self.strides,
+            use_lax=self.use_lax_conv,
+            padding="SAME",
+        )
+        conv2 = layers.Conv2D(
+            self.out_channels,
+            self.out_channels,
+            (3, 3),
+            strides=(1, 1),
+            use_lax=self.use_lax_conv,
+            padding="SAME",
+        )
 
         out = conv1.apply(params["conv1"], inputs)
         out = activations.leaky_relu(out)
@@ -340,10 +355,39 @@ class ResidualBlock(layer_base.Layer):
 
         shortcut = inputs
         if "proj" in params:
-            proj = layers.Conv2D(self.in_channels, self.out_channels, (1, 1), strides=self.strides)
+            proj = layers.Conv2D(
+                self.in_channels,
+                self.out_channels,
+                (1, 1),
+                strides=self.strides,
+                use_lax=self.use_lax_conv,
+                padding="SAME",
+            )
             shortcut = proj.apply(params["proj"], inputs)
 
         return activations.leaky_relu(out + shortcut)
+
+
+@dataclass(frozen=True)
+class GlobalAvgPool2D(layer_base.Layer):
+    """Spatially averages NHWC inputs to shape (batch, channels)."""
+
+    def init(self, rng: PRNGKey) -> Params:
+        _ = rng
+        return {}
+
+    def apply(
+        self,
+        params: Params,
+        inputs: Array,
+        *,
+        rng: PRNGKey | None = None,
+        is_training: bool = True,
+    ) -> Array:
+        _ = (params, rng, is_training)
+        if inputs.ndim != 4:
+            raise ValueError("GlobalAvgPool2D expects NHWC inputs with rank 4 (batch, h, w, c)")
+        return jnp.mean(inputs, axis=(1, 2))
 
 
 def build_model(num_classes: int, *, use_lax_conv: bool = False) -> layers.Sequential:
@@ -387,6 +431,70 @@ def build_model(num_classes: int, *, use_lax_conv: bool = False) -> layers.Seque
         ),
         split_rngs=True,  # Enable RNG splitting for dropout
     )
+
+
+def build_resnet_model(
+    num_classes: int,
+    *,
+    use_lax_conv: bool = False,
+    width_mult: float = 1.0,
+    dropout_rate: float = 0.3,
+) -> layers.Sequential:
+    """Tiny ResNet-style classifier tailored to the 4x5 landmark grid.
+
+    Layout (similar to CIFAR-style ResNet-20):
+      stem: 3x3 conv -> LReLU
+      stage0: 2 residual blocks @ C
+      stage1: downsampling residual block (stride 2) + 1 block @ 2C
+      stage2: downsampling residual block (stride 2) + 1 block @ 4C
+      head: global average pool -> MLP
+    """
+
+    if width_mult <= 0:
+        raise ValueError("width_mult must be > 0")
+
+    base_channels = int(32 * width_mult)
+    channel_schedule = (base_channels, base_channels * 2, base_channels * 4)
+    stage_strides = [(1, 1), (2, 2), (2, 2)]
+
+    layers_list: list[layer_base.Layer] = [
+        layers.Conv2D(
+            in_channels=3,
+            out_channels=channel_schedule[0],
+            kernel_size=(3, 3),
+            padding="SAME",
+            use_lax=use_lax_conv,
+        ),
+        layers.Activation("leaky_relu"),
+        layers.Dropout(rate=0.1),
+    ]
+
+    prev_channels = channel_schedule[0]
+    for stage_idx, (out_channels, stride) in enumerate(zip(channel_schedule, stage_strides)):
+        for block_idx in range(2):
+            block_stride = stride if block_idx == 0 else (1, 1)
+            layers_list.append(
+                ResidualBlock(
+                    in_channels=prev_channels,
+                    out_channels=out_channels,
+                    strides=block_stride,
+                    use_lax_conv=use_lax_conv,
+                )
+            )
+            prev_channels = out_channels
+        if dropout_rate > 0:
+            layers_list.append(layers.Dropout(rate=dropout_rate if stage_idx < 2 else dropout_rate / 2))
+
+    layers_list.extend(
+        [
+            GlobalAvgPool2D(),
+            layers.Dense(in_features=channel_schedule[-1], out_features=128, activation="leaky_relu"),
+            layers.Dropout(rate=0.4),
+            layers.Dense(in_features=128, out_features=num_classes, activation=None),
+        ]
+    )
+
+    return layers.Sequential(tuple(layers_list), split_rngs=True)
 
 
 # ----------------------------- Training loop ------------------------------ #
@@ -440,6 +548,8 @@ def run_training(
     batch_size: int,
     epochs: int,
     learning_rate: float,
+    model_type: str = "baseline",
+    resnet_width_mult: float = 1.0,
     seed: int = 0,
     steps_per_epoch: int | None = None,
     *,
@@ -511,7 +621,20 @@ def run_training(
     print(f"\nClass weighting mode: {class_weighting} (beta={class_weight_beta if class_weighting == 'effective' else 'n/a'})")
     print(f"Weights: {np.round(class_weights, 3).tolist()}")
 
-    network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
+    if model_type == "baseline":
+        network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
+    elif model_type == "resnet":
+        network = build_resnet_model(
+            num_classes=len(class_names),
+            use_lax_conv=fast_training,
+            width_mult=resnet_width_mult,
+        )
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    print(f"Model: {model_type} (width_mult={resnet_width_mult if model_type == 'resnet' else 'n/a'}, "
+          f"use_lax_conv={fast_training})")
+
     rng = jax.random.PRNGKey(seed)
     params = network.init(rng)
 
@@ -624,6 +747,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--model-type", choices=["baseline", "resnet"], default="baseline",
+                        help="Choose between the original CNN ('baseline') and a deeper residual model ('resnet').")
+    parser.add_argument("--resnet-width-mult", type=float, default=1.0,
+                        help="Width multiplier for the ResNet channels (only used when --model-type=resnet).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps-per-epoch", type=int, help="Optional number of batches per epoch (defaults to dataset size / batch).")
     parser.add_argument("--class-weighting", choices=["effective", "inverse", "sqrt", "none"], default="effective",
@@ -656,6 +783,8 @@ def main() -> None:
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
+        model_type=args.model_type,
+        resnet_width_mult=args.resnet_width_mult,
         seed=args.seed,
         steps_per_epoch=args.steps_per_epoch,
         oversample=not args.no_oversample,
