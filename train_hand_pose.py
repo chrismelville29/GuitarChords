@@ -40,22 +40,10 @@ from jaxnn.optim.adam import Adam
 from jaxnn.optim.schedule import cosine_decay_schedule
 from jaxnn.models.hand_graph_attention import HandGraphAttentionNetwork, hand_graph_features
 
-try:  # Prefer PyTorch's writer when available.
-    from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
-except ImportError:  # pragma: no cover - optional dependency
-    TorchSummaryWriter = None  # type: ignore
-
 try:
-    from tensorboardX import SummaryWriter as TensorboardXSummaryWriter
+    import wandb
 except ImportError:  # pragma: no cover - optional dependency
-    TensorboardXSummaryWriter = None  # type: ignore
-
-try:
-    from tensorboard.summary.writer.event_file_writer import EventFileWriter as TensorBoardEventFileWriter
-    from tensorboard.compat.proto import event_pb2, summary_pb2
-except ImportError:  # pragma: no cover - optional dependency
-    TensorBoardEventFileWriter = None  # type: ignore
-    event_pb2 = summary_pb2 = None  # type: ignore
+    wandb = None  # type: ignore
 
 
 Array = types.Array
@@ -63,64 +51,61 @@ Params = types.Params
 PRNGKey = types.PRNGKey
 
 
-class _EventFileSummaryWriter:
-    """Fallback writer that directly emits TensorBoard event files."""
-
-    def __init__(self, log_dir: Path):
-        if TensorBoardEventFileWriter is None or event_pb2 is None or summary_pb2 is None:
-            raise RuntimeError("TensorBoard event writer backend is unavailable.")
-        self._writer = TensorBoardEventFileWriter(str(log_dir))
-
-    def add_scalar(self, tag: str, value: float, step: int) -> None:
-        event = event_pb2.Event(wall_time=time.time(), step=int(step))
-        event.summary.value.add(tag=tag, simple_value=float(value))
-        self._writer.add_event(event)
-
-    def flush(self) -> None:
-        self._writer.flush()
-
-    def close(self) -> None:
-        self._writer.close()
-
-
-def _create_summary_writer(log_dir: Path | None):
-    if log_dir is None:
-        raise RuntimeError(
-            "TensorBoard logging is mandatory; log_dir must be resolved before training."
-        )
-
-    resolved = log_dir.expanduser().resolve()
-    resolved.mkdir(parents=True, exist_ok=True)
-
-    writer = None
-    if TorchSummaryWriter is not None:
-        writer = TorchSummaryWriter(log_dir=str(resolved))
-    elif TensorboardXSummaryWriter is not None:
-        writer = TensorboardXSummaryWriter(log_dir=str(resolved))
-    elif TensorBoardEventFileWriter is not None:
-        writer = _EventFileSummaryWriter(resolved)
-    if writer is None:
-        raise RuntimeError(
-            "TensorBoard logging requires `tensorboard`, `tensorboardX`, or `torch` to be installed."
-        )
-
-    print(f"Logging TensorBoard summaries to {resolved}")
-    print(f"Launch TensorBoard with: tensorboard --logdir {resolved}")
-    return writer
-
-
 def _resolve_log_dir(cli_value: Path | None) -> Path:
-    """Select the TensorBoard log directory with CLI > env > timestamp priority."""
+    """Select the W&B run directory with CLI > env > timestamp priority."""
 
     if cli_value is not None:
         return cli_value
 
-    env_override = os.environ.get("TENSORBOARD_LOGDIR")
+    env_override = os.environ.get("WANDB_DIR")
     if env_override:
         return Path(env_override)
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     return Path("runs") / timestamp
+
+
+def _init_wandb(
+    log_dir: Path,
+    *,
+    project: str | None,
+    entity: str | None,
+    run_name: str | None,
+    mode: str,
+    tags: Sequence[str] | None,
+    config: dict[str, Any],
+):
+    """Initialize Weights & Biases run or return None when unavailable."""
+
+    if mode == "disabled":
+        print("W&B logging disabled; metrics will only be printed to stdout.")
+        return None
+
+    if wandb is None:
+        print("Weights & Biases is not installed; install `wandb` to enable logging.")
+        return None
+
+    resolved = log_dir.expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+
+    init_kwargs: dict[str, Any] = {
+        "project": project or os.environ.get("WANDB_PROJECT") or "guitar-chords",
+        "entity": entity,
+        "name": run_name,
+        "config": config,
+        "mode": mode,
+        "dir": str(resolved),
+        "tags": list(tags) if tags else None,
+    }
+    init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
+
+    run = wandb.init(**init_kwargs)
+    wandb.define_metric("global_step")
+    wandb.define_metric("epoch")
+    wandb.define_metric("*", step_metric="global_step")
+
+    print(f"Logging metrics to W&B project '{init_kwargs.get('project')}' (mode={mode}).")
+    return run
 
 
 def _save_checkpoint(
@@ -836,6 +821,12 @@ def run_training(
     checkpoint_dir: Path | None = None,
     resume_from: Path | None = None,
     checkpoint_every: int = 0,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    wandb_run_name: str | None = None,
+    wandb_mode: str = "online",
+    wandb_tags: Sequence[str] | None = None,
+    early_stop_patience: int = 0,
 ) -> None:
     if swa_start_epoch < 0:
         raise ValueError("swa_start_epoch must be non-negative")
@@ -846,15 +837,18 @@ def run_training(
     if lr_warmup_steps < 0:
         raise ValueError("lr_warmup_steps must be non-negative")
 
+    log_dir = _resolve_log_dir(log_dir)
+    log_dir = log_dir.expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     if checkpoint_dir is None:
-        if log_dir is None:
-            checkpoint_dir = Path("runs") / "checkpoints"
-        else:
-            checkpoint_dir = Path(log_dir) / "checkpoints"
+        checkpoint_dir = log_dir / "checkpoints"
     checkpoint_dir = checkpoint_dir.expanduser().resolve()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt_path = checkpoint_dir / "best.pkl"
     last_ckpt_path = checkpoint_dir / "last.pkl"
+
+    print(f"Run directory: {log_dir}")
 
     train_dir = data_root / "train"
     valid_dir = data_root / "valid"
@@ -971,6 +965,42 @@ def run_training(
     warmup_steps = max(0, lr_warmup_steps)
     decay_span = max(decay_steps - warmup_steps, 1)
 
+    wandb_config: dict[str, Any] = {
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "lr_schedule": lr_schedule,
+        "min_learning_rate": min_learning_rate,
+        "lr_decay_steps": decay_steps,
+        "lr_warmup_steps": warmup_steps,
+        "model_type": model_type,
+        "model_desc": model_desc,
+        "resnet_width_mult": resnet_width_mult,
+        "gat_hidden_dim": gat_hidden_dim,
+        "gat_heads": gat_heads,
+        "gat_layers": gat_layers,
+        "gat_readout": gat_readout,
+        "fast_training": fast_training,
+        "representation": representation,
+        "include_wrist": include_wrist,
+        "use_swa": use_swa,
+        "swa_start_epoch": swa_start_epoch,
+        "seed": seed,
+        "steps_per_epoch": steps,
+        "oversample": oversample,
+        "class_weighting": class_weighting,
+        "class_weight_beta": class_weight_beta,
+        "augment": augment,
+        "num_classes": len(class_names),
+        "class_names": class_names,
+        "data_root": str(data_root),
+        "checkpoint_dir": str(checkpoint_dir),
+        "resume_from": str(resume_from) if resume_from else None,
+        "channel_mean": np.round(channel_mean, 6).tolist(),
+        "channel_std": np.round(channel_std, 6).tolist(),
+        "early_stop_patience": early_stop_patience,
+    }
+
     if lr_schedule == "constant":
         lr_sched_fn = None
     elif lr_schedule == "cosine":
@@ -1013,6 +1043,7 @@ def run_training(
     swa_params: Params | None = None
     swa_count = 0
     start_epoch = 1
+    no_improve_epochs = 0
 
     if resume_from is not None:
         ckpt = _load_checkpoint(resume_from)
@@ -1048,7 +1079,15 @@ def run_training(
     train_step = make_train_step(network, optimizer, weight_decay=1e-4, stat_mask=stat_mask)
     eval_step = make_eval_step(network)
 
-    summary_writer = _create_summary_writer(log_dir)
+    wandb_run = _init_wandb(
+        log_dir,
+        project=wandb_project,
+        entity=wandb_entity,
+        run_name=wandb_run_name,
+        mode=wandb_mode,
+        tags=wandb_tags,
+        config=wandb_config,
+    )
 
     train_iter = batch_iterator(
         train_samples,
@@ -1064,8 +1103,8 @@ def run_training(
 
     if start_epoch > epochs:
         print(f"Checkpoint epoch {start_epoch - 1} >= requested epochs={epochs}; skipping training.")
-        if summary_writer is not None:
-            summary_writer.close()
+        if wandb_run is not None:
+            wandb_run.finish()
         return
 
     epoch_iter = (
@@ -1101,10 +1140,17 @@ def run_training(
             batch_acc = float(jnp.mean(preds == batch["y"]))
             epoch_accs.append(batch_acc)
             current_lr = _current_lr(state.opt_state.step)
-            if summary_writer is not None:
-                summary_writer.add_scalar("loss/train_batch", float(loss_value), global_step)
-                summary_writer.add_scalar("accuracy/train_batch", batch_acc, global_step)
-                summary_writer.add_scalar("lr", current_lr, global_step)
+            if wandb_run is not None:
+                wandb.log(
+                    {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "loss/train_batch": float(loss_value),
+                        "accuracy/train_batch": batch_acc,
+                        "lr": current_lr,
+                    },
+                    step=global_step,
+                )
             if tqdm is not None:
                 step_iter.set_postfix(loss=float(loss_value), acc=batch_acc, lr=current_lr)
             global_step += 1
@@ -1202,6 +1248,9 @@ def run_training(
             best_val_acc = avg_val_acc
             best_epoch = epoch
             improved = True
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
 
         # Stochastic Weight Averaging: start averaging from max(best_epoch, swa_start_epoch)
         if use_swa and epoch >= max(best_epoch, swa_start_epoch):
@@ -1221,13 +1270,20 @@ def run_training(
             f"val_loss={avg_val_loss:.4f} val_acc={avg_val_acc:.4f} lr={epoch_lr:.6g}"
         )
 
-        if summary_writer is not None:
-            summary_writer.add_scalar("loss/train_epoch", float(train_epoch_loss), epoch)
-            summary_writer.add_scalar("accuracy/train_epoch", float(train_epoch_acc), epoch)
-            summary_writer.add_scalar("loss/val", float(avg_val_loss), epoch)
-            summary_writer.add_scalar("accuracy/val", float(avg_val_acc), epoch)
-            summary_writer.add_scalar("lr_epoch", float(epoch_lr), epoch)
-            summary_writer.flush()
+        if wandb_run is not None:
+            wandb.log(
+                {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "loss/train_epoch": float(train_epoch_loss),
+                    "accuracy/train_epoch": float(train_epoch_acc),
+                    "loss/val": float(avg_val_loss),
+                    "accuracy/val": float(avg_val_acc),
+                    "lr_epoch": float(epoch_lr),
+                    "best_val_acc": float(best_val_acc),
+                },
+                step=global_step,
+            )
 
         _save_checkpoint(
             last_ckpt_path,
@@ -1266,6 +1322,13 @@ def run_training(
                 swa_count=swa_count if use_swa else 0,
             )
 
+        if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+            print(
+                f"Early stopping triggered after {no_improve_epochs} epochs without "
+                f"val accuracy improvement (patience={early_stop_patience})."
+            )
+            break
+
     # Optionally swap to SWA-averaged weights for final model use.
     if use_swa and swa_params is not None:
         state = optim_base.TrainState(swa_params, state.opt_state)
@@ -1296,8 +1359,8 @@ def run_training(
     print(f"Checkpoints written to {checkpoint_dir} (last.pkl, best.pkl).")
     if tqdm is not None and hasattr(epoch_iter, "close"):
         epoch_iter.close()
-    if summary_writer is not None:
-        summary_writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def main() -> None:
@@ -1377,7 +1440,7 @@ def main() -> None:
         "--log-dir",
         type=Path,
         help=(
-            "Directory for TensorBoard event files. Defaults to TENSORBOARD_LOGDIR or runs/<timestamp> "
+            "Directory for W&B offline files and checkpoints. Defaults to WANDB_DIR or runs/<timestamp> "
             "when not provided."
         ),
     )
@@ -1396,6 +1459,38 @@ def main() -> None:
         type=int,
         default=0,
         help="If >0, also save a checkpoint every N training steps (in addition to per-epoch/best).",
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        help="Weights & Biases project name (defaults to WANDB_PROJECT or 'guitar-chords').",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        help="Optional W&B entity/organization to log runs under.",
+    )
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        help="Optional human-friendly W&B run name.",
+    )
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="Set W&B logging mode (online sends to the cloud, offline writes locally, disabled skips logging).",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        nargs="*",
+        help="Optional space-separated W&B tags to attach to the run.",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop early if validation accuracy fails to improve for this many epochs (0 disables).",
     )
 
     args = parser.parse_args()
@@ -1432,6 +1527,12 @@ def main() -> None:
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
         checkpoint_every=args.checkpoint_every,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_mode=args.wandb_mode,
+        wandb_tags=args.wandb_tags,
+        early_stop_patience=args.early_stop_patience,
     )
 
 
