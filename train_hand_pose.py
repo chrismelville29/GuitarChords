@@ -125,6 +125,8 @@ def _save_checkpoint(
     data_rng_state: dict | None,
     swa_params: Params | None,
     swa_count: int,
+    model_kwargs: dict | None = None,
+    confusion_matrix: np.ndarray | None = None,
 ) -> None:
     """Persist training state for reproducible resumption/evaluation."""
 
@@ -147,10 +149,31 @@ def _save_checkpoint(
         "data_rng_state": data_rng_state,
         "swa_params": jax.device_get(swa_params) if swa_params is not None else None,
         "swa_count": int(swa_count),
+        "model_kwargs": model_kwargs or {},
+        "confusion_matrix": np.array(confusion_matrix) if confusion_matrix is not None else None,
+    }
+
+    # Aggregate frequently used details for easier consumption.
+    payload["model_details"] = {
+        "model_type": model_type,
+        "model_kwargs": model_kwargs or {},
+        "representation": representation,
+        "include_wrist": include_wrist,
+        "class_names": list(class_names),
+        "channel_mean": np.array(channel_mean),
+        "channel_std": np.array(channel_std),
     }
 
     with open(path, "wb") as f:
         pickle.dump(payload, f)
+
+    # Write a standalone metadata pickle alongside the checkpoint for quick access.
+    meta_path = path.with_name(f"{path.stem}_model_details.pkl")
+    try:
+        with open(meta_path, "wb") as f:
+            pickle.dump(payload["model_details"], f)
+    except Exception as exc:  # pragma: no cover - best effort
+        print(f"[WARN] Failed to write model details to {meta_path}: {exc}")
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
@@ -341,6 +364,75 @@ def _compute_channel_mean_std(
     var = sumsq_channels / total_points - np.square(mean)
     std = np.sqrt(np.maximum(var, 1e-8))
     return mean.astype(np.float32), std.astype(np.float32)
+
+
+def _compute_confusion_matrix(labels: Sequence[int], preds: Sequence[int], num_classes: int) -> np.ndarray:
+    """Return an integer confusion matrix of shape (num_classes, num_classes)."""
+
+    cm = np.zeros((num_classes, num_classes), dtype=np.int32)
+    for y, p in zip(labels, preds):
+        if 0 <= y < num_classes and 0 <= p < num_classes:
+            cm[y, p] += 1
+    return cm
+
+
+def _save_confusion_artifacts(
+    cm: np.ndarray,
+    class_names: Sequence[str],
+    out_dir: Path,
+    tag: str,
+) -> None:
+    """Persist confusion matrix as both an image (PNG) and a small pickle."""
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img_path = out_dir / f"confusion_matrix_{tag}.png"
+    pkl_path = out_dir / f"confusion_matrix_{tag}.pkl"
+
+    # Always persist the numeric values.
+    payload = {"matrix": np.array(cm, dtype=np.int32), "class_names": list(class_names)}
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+
+    # Plot if matplotlib is available; otherwise, skip gracefully.
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - optional dependency
+        print(f"[WARN] Could not plot confusion matrix (matplotlib missing?): {exc}")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set(
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xticklabels=class_names,
+        yticklabels=class_names,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"Confusion Matrix ({tag})",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    thresh = cm.max() if cm.size else 0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(
+                j,
+                i,
+                int(cm[i, j]),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > 0.5 * thresh else "black",
+                fontsize=8,
+            )
+
+    fig.tight_layout()
+    fig.savefig(img_path, dpi=200)
+    plt.close(fig)
 
 
 def _effective_num_class_weights(counts: Counter, beta: float = 0.99) -> np.ndarray:
@@ -930,24 +1022,36 @@ def run_training(
     epoch_size = max_train_count * len(class_names) if oversample else len(train_samples)
     steps = steps_per_epoch or max(1, math.ceil(epoch_size / batch_size))
 
+    model_kwargs: dict[str, Any] = {}
     if model_type == "baseline":
-        network = build_model(num_classes=len(class_names), use_lax_conv=fast_training)
+        model_kwargs = {"use_lax_conv": fast_training}
+        network = build_model(num_classes=len(class_names), use_lax_conv=model_kwargs["use_lax_conv"])
         model_desc = f"baseline (use_lax_conv={fast_training})"
     elif model_type == "resnet":
+        model_kwargs = {"use_lax_conv": fast_training, "width_mult": resnet_width_mult}
         network = build_resnet_model(
             num_classes=len(class_names),
-            use_lax_conv=fast_training,
-            width_mult=resnet_width_mult,
+            use_lax_conv=model_kwargs["use_lax_conv"],
+            width_mult=model_kwargs["width_mult"],
         )
         model_desc = f"resnet (width_mult={resnet_width_mult}, use_lax_conv={fast_training})"
     elif model_type == "gat":
+        model_kwargs = {
+            "hidden_dim": gat_hidden_dim,
+            "num_layers": gat_layers,
+            "num_heads": gat_heads,
+            "readout": gat_readout,
+            "include_wrist": include_wrist,
+            "activation": "gelu",
+        }
         network = HandGraphAttentionNetwork(
             num_classes=len(class_names),
-            hidden_dim=gat_hidden_dim,
-            num_layers=gat_layers,
-            num_heads=gat_heads,
-            readout=gat_readout,
-            include_wrist=include_wrist,
+            hidden_dim=model_kwargs["hidden_dim"],
+            num_layers=model_kwargs["num_layers"],
+            num_heads=model_kwargs["num_heads"],
+            readout=model_kwargs["readout"],
+            include_wrist=model_kwargs["include_wrist"],
+            activation=model_kwargs["activation"],
         )
         model_desc = (
             "gat ("
@@ -1044,6 +1148,7 @@ def run_training(
     swa_count = 0
     start_epoch = 1
     no_improve_epochs = 0
+    last_confusion_matrix: np.ndarray | None = None
 
     if resume_from is not None:
         ckpt = _load_checkpoint(resume_from)
@@ -1173,6 +1278,8 @@ def run_training(
                     data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
                     swa_params=swa_params if use_swa else None,
                     swa_count=swa_count if use_swa else 0,
+                    model_kwargs=model_kwargs,
+                    confusion_matrix=None,
                 )
         if tqdm is not None:
             step_iter.close()
@@ -1227,6 +1334,21 @@ def run_training(
             # Calculate overall metrics
             avg_val_loss = loss_sum / max(1, total_val_samples)
             avg_val_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+            last_confusion_matrix = _compute_confusion_matrix(all_labels, all_preds, len(class_names))
+
+            # Save confusion matrix artifacts each epoch (latest + epoch tag).
+            _save_confusion_artifacts(
+                last_confusion_matrix,
+                class_names,
+                checkpoint_dir,
+                tag=f"epoch{epoch:02d}",
+            )
+            _save_confusion_artifacts(
+                last_confusion_matrix,
+                class_names,
+                checkpoint_dir,
+                tag="latest",
+            )
 
             # Debug: show prediction distribution every 10 epochs
             if epoch % 10 == 0:
@@ -1301,6 +1423,8 @@ def run_training(
             data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
             swa_params=swa_params if use_swa else None,
             swa_count=swa_count if use_swa else 0,
+            model_kwargs=model_kwargs,
+            confusion_matrix=last_confusion_matrix,
         )
 
         if improved:
@@ -1320,7 +1444,16 @@ def run_training(
                 data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
                 swa_params=swa_params if use_swa else None,
                 swa_count=swa_count if use_swa else 0,
+                model_kwargs=model_kwargs,
+                confusion_matrix=last_confusion_matrix,
             )
+            if last_confusion_matrix is not None:
+                _save_confusion_artifacts(
+                    last_confusion_matrix,
+                    class_names,
+                    checkpoint_dir,
+                    tag="best",
+                )
 
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             print(
@@ -1353,6 +1486,8 @@ def run_training(
         data_rng_state=data_rng.bit_generator.state if data_rng is not None else None,
         swa_params=swa_params if use_swa else None,
         swa_count=swa_count if use_swa else 0,
+        model_kwargs=model_kwargs,
+        confusion_matrix=last_confusion_matrix,
     )
 
     print("Training complete. You can now use `network.apply` with the learned params.")
