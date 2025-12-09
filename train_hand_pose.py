@@ -366,13 +366,16 @@ def _compute_channel_mean_std(
     return mean.astype(np.float32), std.astype(np.float32)
 
 
-def _compute_confusion_matrix(labels: Sequence[int], preds: Sequence[int], num_classes: int) -> np.ndarray:
-    """Return an integer confusion matrix of shape (num_classes, num_classes)."""
+def compute_confusion_matrix_normalized(labels, preds, num_classes):
+    cm = np.zeros((num_classes, num_classes), dtype=np.float32)
 
-    cm = np.zeros((num_classes, num_classes), dtype=np.int32)
     for y, p in zip(labels, preds):
         if 0 <= y < num_classes and 0 <= p < num_classes:
-            cm[y, p] += 1
+            cm[y, p] += 1.0
+
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm = np.divide(cm, row_sums, where=row_sums != 0)
+
     return cm
 
 
