@@ -36,6 +36,10 @@ Prereqs: Anaconda/Miniconda, Git, and a C++ build toolchain. Run everything from
   ```
   Landmarks are saved under `data/guitar-chords_landmarks/`; debug overlays go to `data/guitar-chords_debug_viz/`.
 
+## Processed Dataset and pretrained checkpoints
+- The processed roboflow dataset can be downloaded from - https://drive.google.com/file/d/1XpsTTYuLTT7En7xpFWegBy-Z0u9rPvLi/view?usp=sharing 
+- The pretrained checkpoints can be downloaded from - https://drive.google.com/file/d/1qrykf8wfddyiTY4kwlMlkT6EkqM9yspI/view?usp=sharing
+
 ## Train
 - Train a baseline model on the exported landmarks:
   ```bash
