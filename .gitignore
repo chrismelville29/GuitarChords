@@ -5,3 +5,5 @@ jaxnn/build
 jaxnn/jaxnn.egg-info
 __pycache__
 runs
+checkpoints
+evaluation_outputs*

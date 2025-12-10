@@ -55,6 +55,16 @@ Prereqs: Anaconda/Miniconda, Git, and a C++ build toolchain. Run everything from
   ```bash
   python webcam_infer.py --checkpoint checkpoints/<run>/baseline/best.pkl
   ```
+- Batch evaluate the **secondary** dataset and save annotated results:
+  ```bash
+  python dataset_infer.py \
+    --checkpoint checkpoints/<run>/gat/best.pkl \
+    --model-type gat \
+    --split valid
+  ```
+  What it does:
+  - Reads the processed secondary landmarks from `data/guitar_chords_landmarks_secondary/<split>`.
+  - Saves a JPEG per sample with green/red labels showing the true chord and the model’s prediction; the `.npy` files are copied alongside by default. Use `--no-save-npy-copies` if you only want the JPEGs.
 
 ## Maintainers
 Chris Melville, Chris Hardwick, Harsh Chandirasekar - melvi083@umn.edu, hardw050@umn.edu, chand863@umn.edu
