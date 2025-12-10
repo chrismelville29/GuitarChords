@@ -40,4 +40,4 @@ tests/
   ...               # pytest-based regression/unit tests
 ```
 
-See `docs/team_guide.md` for coding rules, workflow conventions, and guidelines on how to extend the library with new modules.
+See `docs/coding_reference.md` for coding rules, workflow conventions, and guidelines on how to extend the library with new modules.
