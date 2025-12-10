@@ -17,6 +17,7 @@ This document lives next to the code so we always have a shared source of truth 
 - **Small, composable files.** Each layer lives in its own module under `jaxnn/nn/layers/`. Keep optimizers self-contained. Push shared helpers (tree math, typing) into `jaxnn/tree.py` and `jaxnn/types.py` so they can be reused.
 - **No hiding control flow inside models.** If you need Python-side loops (curriculum logic, logging, etc.), keep them outside `jax.jit`.
 - **Tests for every public API.** Add minimal `pytest` coverage under `tests/` whenever you launch a new feature. Focus on shape checking and numerical sanity.
+- **Use _ for private functions.** Ensure private functions, variables and classes start with _ , avoid camel case for functions.
 
 ## Working style
 

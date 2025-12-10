@@ -13,8 +13,10 @@ import numpy as np
 MARGIN = 10  # pixels
 FONT_SIZE = 1
 FONT_THICKNESS = 1
-HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green
+HANDEDNESS_TEXT_COLOR = (88, 205, 54) # vibrant green - > used for viewer and viz
 
+
+## Todo - cleanup dataset macros, looks a bit messy
 DATASET_REPO = "dduka/guitar-chords"
 DEFAULT_DATASET_DIR = Path("data/guitar-chords")
 DEFAULT_SECONDARY_DATASET_DIR = Path("data/secondary_data")
