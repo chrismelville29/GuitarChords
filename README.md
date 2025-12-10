@@ -66,5 +66,47 @@ Prereqs: Anaconda/Miniconda, Git, and a C++ build toolchain. Run everything from
   - Reads the processed secondary landmarks from `data/guitar_chords_landmarks_secondary/<split>`.
   - Saves a JPEG per sample with green/red labels showing the true chord and the model’s prediction; the `.npy` files are copied alongside by default. Use `--no-save-npy-copies` if you only want the JPEGs.
 
+## Project layout
+
+```
+jaxnn/
+  __init__.py
+  types.py          # shared type aliases
+  tree.py           # pytree helpers
+  nn/
+    __init__.py
+    activations/
+      __init__.py
+      relu.py
+      gelu.py
+      tanh.py
+    layers/
+      __init__.py
+      base.py
+      dense.py
+      conv2d.py
+      sequential.py
+    init.py         # weight initializers
+    losses.py       # task losses
+    model.py        # convenience helpers for stacking layers
+  optim/
+    __init__.py
+    base.py         # Optimizer protocol + utilities
+    sgd.py          # SGD implementation
+    adam.py         # Adam implementation
+  train/
+    __init__.py
+    loop.py         # reusable train/eval steps
+    metrics.py      # accuracy and other metrics
+examples/
+  mnist_mlp.py      # example script tying everything together
+docs/
+  team_guide.md     # collaboration + coding expectations
+tests/
+  ...               # pytest-based regression/unit tests
+```
+
+See `docs/coding_reference.md` for coding rules, workflow conventions, and guidelines on how to extend the library with new modules.
+
 ## Maintainers
 Chris Melville, Chris Hardwick, Harsh Chandirasekar - melvi083@umn.edu, hardw050@umn.edu, chand863@umn.edu
