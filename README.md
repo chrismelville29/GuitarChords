@@ -6,6 +6,10 @@ Hand pose to guitar chord pipeline built with MediaPipe for landmark extraction 
 - `infer_hand_pose.py` and `webcam_infer.py` for offline image or webcam inference.
 - `jaxnn/` - a small neural network library (installed in editable mode during setup).
 
+<img width="2406" height="1366" alt="image" src="https://github.com/user-attachments/assets/360220ef-4f40-49d6-afcb-56c66d9afbb5" />
+
+<img width="2592" height="3024" alt="G1-final-poster" src="https://github.com/user-attachments/assets/32e39d21-b71e-4c90-9494-00bf64b49592" />
+
 ## Installation (conda)
 Prereqs: Anaconda/Miniconda, Git, and a C++ build toolchain. Run everything from the repo root.
 
